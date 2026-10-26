@@ -1,6 +1,5 @@
 import contextlib
 import io
-import itertools
 import json
 import tempfile
 import unittest
@@ -57,12 +56,14 @@ class SnapshotLoggingTests(unittest.TestCase):
                     final = {"status": game_status, "run_total_actions": 1}
                     errors = ["harness snapshot error: disk full"] if error_path else []
 
-                    def finish_environment(output):
+                    def finish_environment():
+                        output = root
+                        (output / "environment").mkdir(exist_ok=True)
+                        (output / "environment/metrics.json").write_text(json.dumps(final))
                         if error_path:
                             path = output / error_path
                             path.parent.mkdir(parents=True, exist_ok=True)
                             path.write_text(errors[0] + "\n")
-                        return final
 
                     with (
                         patch("run.ModelGateway") as gateway_type,
@@ -73,10 +74,8 @@ class SnapshotLoggingTests(unittest.TestCase):
                             returncode=0, stdout="preflight passed", stderr="",
                         )),
                         patch("run.subprocess.check_output", return_value="fixture-revision\n"),
-                        patch("run.environment_result", side_effect=finish_environment),
-                        patch("run.time.monotonic", side_effect=itertools.chain(
-                            [0], itertools.repeat(DEFAULT_LIMITS.seconds if stop_mode else 0),
-                        )),
+                        patch("run.time.monotonic", side_effect=[0, DEFAULT_LIMITS.seconds if stop_mode else 0,
+                                                                DEFAULT_LIMITS.seconds if stop_mode else 0]),
                         contextlib.redirect_stdout(io.StringIO()),
                     ):
                         distribution.return_value.read_text.return_value = json.dumps({
@@ -84,10 +83,12 @@ class SnapshotLoggingTests(unittest.TestCase):
                         })
                         gateway = gateway_type.return_value
                         gateway.count = 0
-                        gateway.thread.is_alive.return_value = False
+                        gateway.close.return_value = []
+                        process_context.return_value.Array.return_value = [0, 0]
                         process = process_context.return_value.Process.return_value
                         process.is_alive.return_value = bool(stop_mode)
                         process.exitcode = 0
+                        process.start.side_effect = finish_environment
                         if stop_mode:
                             getattr(process, stop_mode).side_effect = lambda: setattr(process.is_alive, "return_value", False)
                         execute(args, DEFAULT_LIMITS)
@@ -95,17 +96,17 @@ class SnapshotLoggingTests(unittest.TestCase):
                             process.terminate.assert_called_once()
                             if stop_mode == "kill":
                                 process.kill.assert_called_once()
-                            gateway.server.server_close.assert_called_once()
+                        gateway.close.assert_called_once()
                     report = json.loads((root / "result.json").read_text())
-                    self.assertEqual(report["limits"], {"seconds": DEFAULT_LIMITS.seconds})
+                    self.assertEqual(report["limits"], {"seconds": DEFAULT_LIMITS.seconds, "max_actions": None})
+                    self.assertTrue(report["final_state_saved"])
                     self.assertEqual(
                         {key: report[key] for key in (
-                            "status", "logging_complete", "snapshot_errors", "environment", "stop_reason",
+                            "status", "logging_complete", "environment", "stop_reason",
                         )},
                         {
-                            "status": "incomplete" if errors else run_status,
-                            "logging_complete": not errors,
-                            "snapshot_errors": errors,
+                            "status": "incomplete" if errors or stop_mode else run_status,
+                            "logging_complete": not (errors or stop_mode),
                             "environment": final,
                             "stop_reason": "time_limit" if stop_mode else (
                                 "game_completed" if game_status == "COMPLETED_RUN" else "environment_exit"

@@ -55,11 +55,17 @@ records `host`, with null scope/session/refinement metadata where unknown.
 Reads and rejected writes do not create snapshots. A refinement that persists
 history but applies no entry edits still produces a snapshot.
 
+The experiment finalizer can also write `source: "run_end"` when the final
+committed state has no matching latest snapshot. It uses the capture timestamp
+and a null refinement ID, not a fabricated agent decision. It records the stop
+reason and whether writers had stopped. Recovery never writes back to live state.
+
 There are no automatic initial snapshots, pending transactions, recovery
-replays, external-change detection, compression, or pruning. Old schema-1
-snapshots are left untouched; new writes do not read or depend on old history.
+replays, periodic snapshots, compression, or pruning. Old schema-1
+snapshots are left untouched; runtime saves do not read or depend on old history.
 The experiment wrapper separately captures initial/final state files, including
-an empty mapping when no store has been created.
+an empty mapping when no store has been created, and checks final-state coverage
+against the snapshot history after writers stop.
 
 ## Preserving agent behavior
 
@@ -81,7 +87,11 @@ runner also sets `logging_complete` to false and retains the original
 `stop_reason` and environment outcome.
 
 This deliberately prioritizes agent behavior over crash-proof log delivery.
-A process or machine failure after the live save may lose its final snapshot.
+The runner closes model admission and requests daemon shutdown before escalating
+to forced termination. It saves the final readable committed state before parsing
+logs; a missing final snapshot can be recovered as `run_end`. Forced termination,
+record corruption, and missing history remain explicitly incomplete even after
+recovery. A whole-machine failure or disk failure can still lose data.
 Diagnostics also depend on a functioning host output channel. Snapshots contain
 task data, have owner-only file permissions, and should not be committed or
 uploaded indiscriminately.

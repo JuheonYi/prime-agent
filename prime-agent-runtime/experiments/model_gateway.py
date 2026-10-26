@@ -70,6 +70,11 @@ class ModelGateway:
         self.deadline = 0.0
         self.count = 0
         self.lock = threading.Lock()
+        self.settled = threading.Condition(self.lock)
+        self.pending = set()
+        self.stopping = False
+        self.sealed = False
+        self.stop_requested = None
         gateway = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -100,11 +105,12 @@ class ModelGateway:
                     self.send_error(400, "invalid or forbidden model request")
                     return
                 with gateway.lock:
-                    if time.monotonic() >= gateway.deadline:
+                    if gateway.stopping or (gateway.stop_requested is not None and gateway.stop_requested.is_set()) or time.monotonic() >= gateway.deadline:
                         self.send_error(429, "experiment time limit")
                         return
                     gateway.count += 1
                     number = gateway.count
+                    gateway.pending.add(number)
                     with gateway.log.open("a") as stream:
                         stream.write(json.dumps({"event": "started", "request": number,
                                                  "model": MODEL, "output_cap": tokens}) + "\n")
@@ -120,7 +126,7 @@ class ModelGateway:
                         if name in self.headers:
                             headers[name] = self.headers[name]
                     remaining = gateway.deadline - time.monotonic()
-                    if remaining <= 0:
+                    if gateway.stopping or remaining <= 0:
                         raise TimeoutError("experiment deadline")
                     with requests.Session() as session:
                         session.trust_env = False
@@ -136,7 +142,7 @@ class ModelGateway:
                             self.close_connection = True
                             pending = b""
                             for chunk in response.iter_content(chunk_size=1024):
-                                if time.monotonic() >= gateway.deadline:
+                                if gateway.stopping or time.monotonic() >= gateway.deadline:
                                     raise TimeoutError("experiment deadline")
                                 self.wfile.write(chunk)
                                 self.wfile.flush()
@@ -153,10 +159,14 @@ class ModelGateway:
                         self.send_error(502, "native Copilot transport failed")
                 finally:
                     record["seconds"] = time.monotonic() - started
-                    with gateway.lock, gateway.log.open("a") as stream:
-                        if isinstance(usage, dict) and isinstance(usage.get("output_tokens"), int):
-                            record["usage"] = usage
-                        stream.write(json.dumps(record) + "\n")
+                    with gateway.settled:
+                        if not gateway.sealed:
+                            with gateway.log.open("a") as stream:
+                                if isinstance(usage, dict) and isinstance(usage.get("output_tokens"), int):
+                                    record["usage"] = usage
+                                stream.write(json.dumps(record) + "\n")
+                        gateway.pending.discard(number)
+                        gateway.settled.notify_all()
 
         self.server = UnixServer(str(socket), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -175,9 +185,26 @@ class ModelGateway:
         self.deadline = deadline
         self.thread.start()
 
-    def close(self):
+    def stop_admission(self):
+        self.stopping = True
         self.deadline = 0
-        self.server.shutdown()
+
+    def close(self, *, grace_seconds=2):
+        self.stop_admission()
+        if self.thread.is_alive():
+            self.server.shutdown()
         self.server.server_close()
-        self.thread.join()
+        if self.thread.ident is not None:
+            self.thread.join()
+        errors = []
+        with self.settled:
+            self.settled.wait_for(lambda: not self.pending, timeout=grace_seconds)
+            if self.pending:
+                errors.append(f"model requests interrupted before gateway settled: {sorted(self.pending)}")
+                with self.log.open("a") as stream:
+                    for number in sorted(self.pending):
+                        stream.write(json.dumps({"event": "interrupted", "request": number,
+                                                 "reason": "experiment shutdown; usage may be unavailable"}) + "\n")
+            self.sealed = True
         self.socket.unlink(missing_ok=True)
+        return errors

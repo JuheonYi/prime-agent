@@ -1,18 +1,18 @@
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from prolong_agent.agent.base import BaseAgent
 from prolong_agent.agent.action_queue import ActionQueue
-from prolong_agent.environment.runner import GameRunner
 
 from backends.prime_agent import PrimeAgentBackend
 from envs.arc import ArcEnvironment
 from faux_harness_run import check_tool_errors
 from run import configure_agent
+from finalization import finalize
 
 REPO = Path(__file__).resolve().parents[3]
 DATA = Path("/data/juheon/primeagent")
@@ -96,14 +96,10 @@ rlm.harness.create_memory("Child", "isolated", id="child-safe")
                                         DATA / "envs/kernel", DATA / "envs/python", root, root / "io",
                                         time.monotonic() + 60, faux=faux)
             env = ArcEnvironment("ls20-9607627b", DATA / "benchmarks/arc-agi-3",
-                                 root / "environment")
+                                 root / "environment", max_actions=3)
             try:
                 env.prepare()
-                # Bound this scripted fixture, not the production experiment.
-                with patch("envs.arc.GameRunner", side_effect=lambda **kwargs: GameRunner(
-                    **(kwargs | {"max_actions_per_game": 3})
-                )):
-                    metrics = env.run(backend.analyze)
+                metrics = env.run(backend.analyze)
                 self.assertEqual(metrics["run_total_actions"], 3)
                 self.assertEqual(backend.calls, 2)
                 self.assertEqual(
@@ -136,3 +132,70 @@ rlm.harness.create_memory("Child", "isolated", id="child-safe")
             finally:
                 backend.close()
                 env.close()
+            self.assertEqual(json.loads((root / "shutdown.json").read_text()),
+                             {"forced": False, "writers_stopped": True, "errors": []})
+
+    def test_deadline_stops_a_live_kernel_and_preserves_its_committed_harness(self):
+        with tempfile.TemporaryDirectory(prefix="prolong-shutdown-") as temporary:
+            root = Path(temporary)
+            for name in ("workspace", "agent", "io"):
+                (root / name).mkdir()
+            (root / "agent/models.json").write_text(json.dumps({"providers": {"faux": {
+                "api": "faux", "baseUrl": "http://localhost:0", "apiKey": "fixture",
+                "models": [{"id": "faux-1", "contextWindow": 128000}],
+            }}}))
+            (root / "agent/settings.json").write_text(json.dumps({
+                "defaultProvider": "faux", "defaultModel": "faux-1",
+                "allowedModels": ["faux/faux-1"], "telemetry": {"enabled": False},
+            }))
+            stopped = threading.Event()
+            ready = threading.Event()
+            faux = {"responses": [tool("""
+from pathlib import Path
+import asyncio
+rlm.harness.create_memory("Final lesson", "committed before deadline", id="final-lesson")
+Path("/workspace/saved").write_text("ready")
+await asyncio.sleep(60)
+""")]}
+            backend = PrimeAgentBackend(DATA / "build/target/debug/prime-agent", REPO,
+                                        DATA / "envs/kernel", DATA / "envs/python", root, root / "io",
+                                        time.monotonic() + 30, faux=faux, stop_requested=stopped)
+            env = ArcEnvironment("ls20-9607627b", DATA / "benchmarks/arc-agi-3", root / "environment")
+
+            def expire_after_save():
+                until = time.monotonic() + 20
+                while not (root / "workspace/saved").exists() and time.monotonic() < until:
+                    if stopped.wait(0.02):
+                        return
+                if (root / "workspace/saved").exists():
+                    ready.set()
+                    backend.deadline = time.monotonic()
+                    stopped.set()
+
+            watcher = threading.Thread(target=expire_after_save)
+            watcher.start()
+            try:
+                env.prepare()
+                with self.assertLogs("prolong_agent.environment.runner", level="ERROR"):
+                    env.run(backend.analyze, check_stop=backend.check_stop)
+            finally:
+                stopped.set()
+                backend.close()
+                env.close()
+                watcher.join(timeout=2)
+            self.assertTrue(ready.is_set(), "the real kernel never reached the committed-save checkpoint")
+            self.assertFalse(watcher.is_alive())
+            shutdown = json.loads((root / "shutdown.json").read_text())
+            self.assertTrue(shutdown["writers_stopped"])
+            self.assertFalse(shutdown["forced"], shutdown)
+            report = finalize(root, {}, {
+                "stop_reason": "time_limit", "limits": {"seconds": 30, "max_actions": None},
+                "shutdown": shutdown, "runner_error": None, "worker_exit_code": 0, "model_requests": 0,
+            })
+            self.assertTrue(report["final_state_saved"])
+            self.assertEqual(report["snapshots"], 1)
+            self.assertEqual(report["recovered_final_snapshots"], [])
+            states = json.loads((root / "final-harness-states.json").read_text())
+            self.assertEqual(len(states), 1)
+            self.assertEqual(next(iter(states.values()))["entries"]["memory"]["final-lesson"]["content"],
+                             "committed before deadline")

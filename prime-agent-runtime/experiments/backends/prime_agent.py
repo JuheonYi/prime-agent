@@ -14,15 +14,21 @@ from prolong_agent.agent.base import BaseAgent
 
 from model_gateway import MODEL
 from sandbox import command
+from contracts import SHUTDOWN_GRACE_SECONDS, process_start, write_json
 
 
 class PrimeAgentBackend(BaseAgent):
     def __init__(self, binary: Path, repo: Path, kernel: Path, python_home: Path,
-                 output: Path, io: Path, deadline: float, *, faux: dict | None = None):
+                 output: Path, io: Path, deadline: float, *, faux: dict | None = None,
+                 stop_requested=None, process_identity=None):
         super().__init__(grid_mode="hex", log_window=None, workspace="/workspace")
         self.binary, self.repo, self.kernel, self.python_home = binary, repo, kernel, python_home
         self.output, self.io, self.deadline = output, io, deadline
         self.faux = faux
+        self.stop_requested = stop_requested
+        self.process_identity = process_identity
+        self.close_deadline = None
+        self.closed = False
         self.process = None
         self.events = queue.Queue()
         self.session_id = None
@@ -50,8 +56,11 @@ class PrimeAgentBackend(BaseAgent):
         self.daemon_log = (self.output / "daemon.log").open("w")
         self.process = subprocess.Popen(launch, stdin=subprocess.DEVNULL, stdout=self.daemon_log,
                                         stderr=self.stderr)
+        if self.process_identity is not None:
+            self.process_identity[:] = [self.process.pid, process_start(self.process.pid) or 0]
         self.connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         while True:
+            self.check_stop()
             try:
                 self.connection.connect(str(self.output / "agent/eval.sock"))
                 break
@@ -102,17 +111,26 @@ class PrimeAgentBackend(BaseAgent):
         finally:
             self.events.put(EOFError("Prime Agent daemon connection closed"))
 
-    def _next(self):
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
+    def check_stop(self):
+        if time.monotonic() >= self.deadline:
             raise TimeoutError("experiment time limit")
-        try:
-            event = self.events.get(timeout=remaining)
-        except queue.Empty:
-            raise TimeoutError("experiment time limit") from None
-        if isinstance(event, BaseException):
-            raise event
-        return event
+        if self.stop_requested is not None and self.stop_requested.is_set():
+            raise InterruptedError("experiment stop requested")
+
+    def _next(self):
+        while True:
+            if self.close_deadline is None:
+                self.check_stop()
+            remaining = (self.close_deadline if self.close_deadline is not None else self.deadline) - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("daemon shutdown timeout" if self.close_deadline is not None else "experiment time limit")
+            try:
+                event = self.events.get(timeout=min(0.2, remaining))
+            except queue.Empty:
+                continue
+            if isinstance(event, BaseException):
+                raise event
+            return event
 
     def _rpc(self, kind, **values):
         self.rpc_id += 1
@@ -133,8 +151,7 @@ class PrimeAgentBackend(BaseAgent):
                 return event
 
     def analyze(self, log_path: Path, action_num: int, retry_nudge: str = "", **kwargs):
-        if time.monotonic() >= self.deadline:
-            raise TimeoutError("experiment time limit")
+        self.check_stop()
         sandbox = self.output / "workspace"
         self._sync_history(log_path, sandbox)
         self._add_current_board(log_path, kwargs)
@@ -175,18 +192,48 @@ class PrimeAgentBackend(BaseAgent):
                 "meta": {"output": text, **usage, "model": MODEL, "cumulative": False}}
 
     def close(self):
-        if self.process is not None:
-            if self.process.poll() is None:
-                self.process.terminate()
+        if self.closed:
+            return
+        self.closed = True
+        self.close_deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS / 2
+        shutdown = {"forced": False, "writers_stopped": True, "errors": []}
+        try:
+            if self.process is not None and self.process.poll() is None:
                 try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
+                    if self.output_stream is not None:
+                        self._rpc("shutdown")
+                    else:
+                        raise RuntimeError("daemon connection not ready for orderly shutdown")
+                    self.process.wait(timeout=max(0.1, self.close_deadline - time.monotonic()))
+                except (OSError, EOFError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as error:
+                    shutdown["errors"].append(f"daemon shutdown: {type(error).__name__}: {error}")
+                    shutdown["forced"] = True
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=1)
+        finally:
+            if self.process is not None:
+                shutdown["writers_stopped"] = self.process.poll() is not None
+                if not shutdown["writers_stopped"]:
                     self.process.kill()
-                    self.process.wait(timeout=5)
+                    self.process.wait(timeout=1)
+                    shutdown["writers_stopped"] = True
+                    shutdown["forced"] = True
+                if self.process_identity is not None:
+                    self.process_identity[:] = [0, 0]
             if self.connection is not None:
-                self.connection.shutdown(socket.SHUT_RDWR)
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError as error:
+                    shutdown["errors"].append(f"daemon connection close: {error}")
             if self.reader is not None:
-                self.reader.join(timeout=5)
-        for stream in (self.input, self.output_stream, self.connection, self.log, self.stderr, self.daemon_log):
-            if stream is not None:
-                stream.close()
+                self.reader.join(timeout=1)
+                if self.reader.is_alive():
+                    shutdown["errors"].append("daemon log reader did not stop")
+            for stream in (self.input, self.output_stream, self.connection, self.log, self.stderr, self.daemon_log):
+                if stream is not None:
+                    stream.close()
+            write_json(self.output / "shutdown.json", shutdown)

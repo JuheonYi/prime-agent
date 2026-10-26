@@ -95,24 +95,39 @@ checks, and login only. `run.py` handles both real 60-second smoke runs and long
 experiments. Output directories must be new. This command consumes real model
 quota; installation never starts it automatically.
 
-### Time-only experiment budget
+### Time and optional game-action budget
 
-`--seconds` is the only experiment budget (default: 600). There is no total
-action, request, or output-token budget, and no wrapper-imposed model concurrency
-limit. Counts and usage are still logged. The wrapper's 8,192-token output
+`--seconds` defaults to 600. `--max-actions` is optional and defaults to unlimited.
+It counts actual game actions across levels and retries (including in-game
+RESET), not LLM requests or Python/tool calls. A plan of 20 executed moves costs
+20 game actions. Execution stops at whichever configured budget is reached
+first, with `time_limit` or `action_limit` recorded separately.
+
+The two-hour command examples use 5,000 game actions: headroom over a simple
+extrapolation of the observed LS20 run (722 actions in 30 minutes), not a promise
+of two hours or task completion. Use `--max-actions 500` for the PRO-LONG paper's
+standard action budget; its extended Fable evaluation used 2,000. Those are
+different experimental conditions, not equivalent wall-clock durations.
+
+There is no model request or output-token budget, and no wrapper-imposed model
+concurrency limit. Counts and usage are still logged. The wrapper's 8,192-token output
 override, 4-MiB request-body ceiling, and 90-second streaming read ceiling are
 removed; provider streaming reads use the remaining experiment time.
 
 The pinned PRO-LONG API takes numeric action bounds. The adapter passes actual
-positive infinity to its two comparison-only bounds, not a large finite count.
+positive infinity to its two comparison-only bounds when `--max-actions` is
+omitted, not a large finite count.
 Upstream source is unchanged; infinity is not serialized into manifests or
 metrics. The original 20-action **plan length**, prompts, reset/queue policy,
 game rules, main/refiner reasoning, and Prime Agent's native per-request output
 policy remain unchanged. The model configuration no longer overrides `maxTokens`.
 
 The parent process enforces the deadline even during tool execution or retries.
+It stops admission of new work, gives the daemon a bounded shutdown grace
+period, then escalates only if necessary. Cleanup is separate from the task
+budget and cannot start another model request or game action.
 Game completion, an actual error, or user interruption can end a run earlier;
-usage counters cannot. Setup's offline checks have their own bounded diagnostic
+model-usage counters cannot. Setup's offline checks have their own bounded diagnostic
 timeouts and do not spend model quota. No monetary/token spending cap is implied
 by a wall-clock limit.
 
@@ -207,9 +222,9 @@ through the repository's `copilot_credentials` helper over a private pipe.
 The gateway rejects other models/routes, redirects, remote image/file URLs,
 and server-side tools such as web search. No coproxy or Copilot SDK is used.
 
-The manifest and result record `limits: {"seconds": ...}`. PRO-LONG's own
-retry/reset/queue policy is preserved; only the experiment's accumulated action
-bound is disabled. The gateway continues validating model, route, credentials,
+The manifest and result record `limits: {"seconds": ..., "max_actions": null}`
+when no action cap is requested, or its explicit count. PRO-LONG's own
+retry/reset/queue policy is preserved. The gateway continues validating model, route, credentials,
 and request shape without applying experiment usage budgets.
 
 This is not a separate VM or protection against kernel vulnerabilities. Hard
@@ -239,10 +254,35 @@ parser/queue behavior, grid logging, and snapshots. The final command uses real
 inference quota. Output directories must be new.
 
 `result.json` reports the stop reason, model usage, upstream metrics, and harness
-state/snapshot counts. Snapshot errors from root stderr, kernel stderr, or daemon
-worker stderr (including child workers) set `logging_complete` to false and
-`status` to `incomplete`; the game outcome and stop reason remain unchanged.
-If the worker is interrupted at its deadline, the report
-explicitly labels progress parsed from the upstream log as partial metrics.
-Original agent sessions, prompt records, and PRO-LONG logs are preserved.
-Copilot billing is not inferred from model cost placeholders.
+state/snapshot counts. Finalization first atomically captures the latest committed
+states into `final-harness-states.json`, independently of transcript parsing.
+Only Continual Harness state is captured, not model context or kernel memory.
+
+- `final_state_saved`: all discovered live stores were read and captured after
+  their writers stopped. Partial readable stores are still saved if another
+  store is corrupt, but this flag stays false.
+- `changed_harness_stores`: full-state differences from the initial capture.
+- `recovered_final_snapshots`: `source: "run_end"` copies added only when a
+  changed final state has no matching latest snapshot. These do not invent an
+  original refinement time/ID and never change the live state.
+- `logging_complete`: no detected snapshot gaps, damaged records, or unclean
+  shutdown. A recovered final state does not make lost intermediate history
+  complete; this flag is not proof against every possible machine failure.
+- `refinement_errors`: failed refinement events/diagnostics, separate from a
+  review that declines to refine. Such failures make the experiment `failed`
+  even if the game continued.
+- `log_errors`, `state_errors`, `snapshot_errors`, and `shutdown`: explicit
+  record locations, capture failures, and forced or unsettled shutdown details.
+
+Truncated or corrupt JSONL records are reported without deleting or rewriting
+the originals. Valid records still contribute to usage and diagnostics.
+Detected logging gaps set `status: "incomplete"` while preserving the game
+outcome and stop reason. Fatal disk failures still propagate; the runner never
+claims a report was saved when publication fails. The command exits nonzero for
+failed/incomplete experiments.
+
+If metrics were interrupted, progress parsed from the upstream game log is
+labeled partial. Deadline time, stop request time, and final capture time are
+separate: cleanup may finish a save already in progress, not an unfinished model
+proposal. No periodic or per-compaction snapshots are forced. Original session
+and game logs are preserved. Copilot billing is not inferred from placeholders.

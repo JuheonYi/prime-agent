@@ -139,3 +139,28 @@ class TimeOnlyGatewayTests(unittest.TestCase):
             self.assertIn(b"experiment time limit", body)
             self.assertEqual(gateway.count, 0)
             provider.assert_not_called()
+
+    def test_shutdown_marks_unsettled_requests_and_prevents_late_log_writes(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class Session(RecordingSession):
+            def post(self, url, **kwargs):
+                started.set()
+                if not release.wait(timeout=10):
+                    raise RuntimeError("fixture release missing")
+                return UsageResponse()
+
+        with gateway_fixture() as (gateway, root), patch("model_gateway.requests.Session", Session):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending = pool.submit(request, gateway)
+                self.assertTrue(started.wait(timeout=5))
+                try:
+                    errors = gateway.close(grace_seconds=0)
+                    self.assertEqual(len(errors), 1)
+                    before = (root / "requests.jsonl").read_bytes()
+                    self.assertIn(b'"event": "interrupted"', before)
+                finally:
+                    release.set()
+                pending.result()
+                self.assertEqual((root / "requests.jsonl").read_bytes(), before)

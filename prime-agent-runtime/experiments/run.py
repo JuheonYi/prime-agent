@@ -8,35 +8,21 @@ import importlib.metadata
 import json
 import multiprocessing
 import os
-import re
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 
-from contracts import Environment, RunLimits, capture_states, snapshot_errors
+from contracts import Environment, RunLimits, SHUTDOWN_GRACE_SECONDS, capture_states, process_start, write_json
 from backends.prime_agent import PrimeAgentBackend
 from envs.arc import ArcEnvironment, PROLONG_REVISION
+from finalization import finalize, model_usage, read_json, timestamp
 from model_gateway import MODEL, ModelGateway
 from sandbox import command
 
 DEFAULT_LIMITS = RunLimits(seconds=600)
-
-
-def write_json(path, value):
-    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
-
-
-def model_usage(log: Path):
-    rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-    completed = [row for row in rows if isinstance(row.get("usage"), dict)]
-    return {
-        "responses_with_usage": len(completed),
-        "input_tokens": sum(row["usage"].get("input_tokens", 0) for row in completed),
-        "cached_input_tokens": sum(row["usage"].get("input_tokens_details", {}).get("cached_tokens", 0) for row in completed),
-        "output_tokens": sum(row["usage"].get("output_tokens", 0) for row in completed),
-        "note": "Completed responses only; an interrupted request can have unreported usage. Billing is not inferred.",
-    }
 
 
 def configure_agent(directory: Path):
@@ -59,33 +45,55 @@ def configure_agent(directory: Path):
     })
 
 
-def run_game(args, root, io, deadline):
+def run_game(args, limits, root, io, deadline, stop_requested, backend_identity):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     repo = Path(__file__).resolve().parents[2]
     backend = PrimeAgentBackend(args.binary.resolve(), repo, args.kernel.resolve(),
-                                args.python_home.resolve(), root, io, deadline)
-    env: Environment = ArcEnvironment(args.task, args.data.resolve(), root / "environment")
+                                args.python_home.resolve(), root, io, deadline,
+                                stop_requested=stop_requested, process_identity=backend_identity)
+    env: Environment = ArcEnvironment(args.task, args.data.resolve(), root / "environment",
+                                      max_actions=limits.max_actions)
     try:
         env.prepare()
-        env.run(backend.analyze)
+        env.run(backend.analyze, check_stop=backend.check_stop)
     finally:
-        backend.close()
-        env.close()
+        stop_requested.set()
+        try:
+            backend.close()
+        finally:
+            env.close()
 
 
-def environment_result(root):
-    path = root / "environment/metrics.json"
-    if path.exists():
-        return json.loads(path.read_text())
-    log = root / "environment/logs.txt"
-    actions = []
-    if log.exists():
-        actions = re.findall(r"^Action (\d+) \|.*?Score: (\d+)", log.read_text(), re.MULTILINE)
-    return {
-        "status": "INTERRUPTED", "partial_metrics": True,
-        "run_total_actions": max((int(action) for action, _ in actions), default=0),
-        "final_score": max((int(score) for _, score in actions), default=0),
-        "note": "Progress parsed from the original PRO-LONG log because the worker was stopped.",
-    }
+def stop_worker(process, stop_requested, backend_identity) -> dict:
+    stop_requested.set()
+    shutdown = {"forced": False, "writers_stopped": True, "errors": []}
+    if process is not None and process.pid is not None:
+        process.join(timeout=SHUTDOWN_GRACE_SECONDS)
+        if process.is_alive():
+            shutdown["forced"] = True
+            process.terminate()
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1)
+        shutdown["writers_stopped"] = not process.is_alive()
+    pid, started = backend_identity[:]
+    if pid and process_start(pid) == started:
+        shutdown["forced"] = True
+        for termination in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, termination)
+            except ProcessLookupError:
+                break
+            deadline = time.monotonic() + 1
+            while process_start(pid) == started and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if process_start(pid) != started:
+                break
+        if process_start(pid) == started:
+            shutdown["writers_stopped"] = False
+            shutdown["errors"].append("sandbox process did not terminate")
+    return shutdown
 
 
 def execute(args, limits: RunLimits):
@@ -101,7 +109,8 @@ def execute(args, limits: RunLimits):
     (root / "agent").mkdir()
     (root / "workspace").mkdir()
     configure_agent(root / "agent")
-    write_json(root / "initial-harness-states.json", capture_states(root / "agent"))
+    initial = capture_states(root / "agent")
+    write_json(root / "initial-harness-states.json", initial)
     repo = Path(__file__).resolve().parents[2]
     distribution = importlib.metadata.distribution("prolong-agent")
     provenance = json.loads(distribution.read_text("direct_url.json"))
@@ -127,6 +136,15 @@ def execute(args, limits: RunLimits):
         gateway = ModelGateway(io / "model.sock", args.credential_helper.resolve(), args.auth_dir.resolve(),
                                root / "model-requests.jsonl")
         process = None
+        context = multiprocessing.get_context("spawn")
+        stop_requested = context.Event()
+        backend_identity = context.Array("q", [0, 0])
+        gateway.stop_requested = stop_requested
+        started = None
+        deadline_at = None
+        reason = "runner_error"
+        failure = None
+        shutdown = {"forced": False, "writers_stopped": False, "errors": []}
         try:
             # Resolve credentials before the timed run, never forwarding them into bwrap.
             gateway.credentials()
@@ -155,10 +173,11 @@ print('SANDBOX_PREFLIGHT_PASSED')
                 raise RuntimeError("sandbox/skill preflight failed; no inference started")
             started = time.monotonic()
             deadline = started + limits.seconds
+            deadline_at = time.time() + limits.seconds
             gateway.start(deadline)
             reason = "environment_exit"
-            process = multiprocessing.get_context("spawn").Process(
-                target=run_game, args=(args, root, io, deadline),
+            process = context.Process(
+                target=run_game, args=(args, limits, root, io, deadline, stop_requested, backend_identity),
             )
             process.start()
             while process.is_alive():
@@ -166,58 +185,56 @@ print('SANDBOX_PREFLIGHT_PASSED')
                     reason = "time_limit"
                     break
                 process.join(timeout=0.1)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=5)
-            final = environment_result(root)
-            if reason == "environment_exit":
-                if final["status"] == "COMPLETED_RUN":
-                    reason = "game_completed"
             if reason == "environment_exit" and time.monotonic() >= deadline:
                 reason = "time_limit"
-            errors = snapshot_errors(root)
-            model_errors = []
-            for path in (root / "agent").rglob("*.jsonl"):
-                for line in path.read_text().splitlines():
-                    message = json.loads(line).get("message", {})
-                    if message.get("role") == "assistant" and message.get("stopReason") == "error":
-                        model_errors.append(message.get("errorMessage", "model request failed"))
-            write_json(root / "final-harness-states.json", capture_states(root / "agent"))
-            report = {
-                "status": "completed" if final["status"] == "COMPLETED_RUN" else (
-                    "failed" if reason == "environment_exit" and (process.exitcode != 0 or model_errors or final["status"] == "ERROR") else "stopped"
-                ),
-                "stop_reason": reason, "elapsed_seconds": time.monotonic() - started,
-                "limits": asdict(limits),
-                "worker_exit_code": process.exitcode, "model_requests": gateway.count,
-                "model_errors": model_errors,
-                "usage": model_usage(root / "model-requests.jsonl"),
-                "environment": final, "logging_complete": not errors, "snapshot_errors": errors,
-                "harness_stores": len(capture_states(root / "agent")),
-                "snapshots": len(list((root / "agent").rglob("snapshots/*.json"))),
-            }
-            if errors:
-                report["status"] = "incomplete"
-            write_json(root / "result.json", report)
-            print(json.dumps(report, indent=2))
+        except KeyboardInterrupt:
+            reason = "user_interrupt"
+        except Exception as error:
+            # Reporting must survive a runner failure, but never turn it into success.
+            failure = f"{type(error).__name__}: {error}"
+            print(f"Experiment failed: {failure}", file=sys.stderr)
         finally:
-            if process is not None and process.is_alive():
-                process.kill()
-                process.join(timeout=5)
-            if gateway.thread.is_alive():
-                gateway.close()
-            else:
-                gateway.server.server_close()
-                gateway.socket.unlink(missing_ok=True)
+            stop_requested.set()
+            gateway.stop_admission()
+            stopping_at = timestamp()
+            try:
+                shutdown = stop_worker(process, stop_requested, backend_identity)
+                saved_shutdown = root / "shutdown.json"
+                if saved_shutdown.exists():
+                    errors = []
+                    saved = read_json(saved_shutdown, root, errors)
+                    shutdown["errors"].extend(errors)
+                    if saved is not None:
+                        if (type(saved.get("forced")) is not bool or type(saved.get("writers_stopped")) is not bool
+                                or not isinstance(saved.get("errors"), list)):
+                            shutdown["errors"].append("invalid daemon shutdown report")
+                        else:
+                            shutdown["forced"] |= saved["forced"]
+                            shutdown["writers_stopped"] &= saved["writers_stopped"]
+                            shutdown["errors"].extend(saved["errors"])
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                shutdown["errors"].append(f"worker shutdown: {type(error).__name__}: {error}")
+            try:
+                shutdown["errors"].extend(gateway.close())
+            except (OSError, RuntimeError) as error:
+                shutdown["errors"].append(f"gateway shutdown: {type(error).__name__}: {error}")
+            report = finalize(root, initial, {
+                "stop_reason": reason,
+                "elapsed_seconds": time.monotonic() - started if started is not None else 0,
+                "deadline_epoch_seconds": deadline_at, "stop_requested_at": stopping_at,
+                "limits": asdict(limits), "shutdown": shutdown, "runner_error": failure,
+                "worker_exit_code": process.exitcode if process is not None else None,
+                "model_requests": gateway.count,
+            })
+    print(json.dumps(report, indent=2))
+    return report
 
 
 def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", default="ls20")
     parser.add_argument("--seconds", type=int, default=DEFAULT_LIMITS.seconds)
+    parser.add_argument("--max-actions", type=int, help="Optional total game actions; unlimited when omitted")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, default=os.environ.get("DATA_ROOT"),
                         help="Installation root (defaults to DATA_ROOT); explicit paths override it")
@@ -241,11 +258,13 @@ def parse_arguments(argv=None):
     if missing:
         parser.error("Set DATA_ROOT or supply these paths: " + ", ".join(missing))
     try:
-        limits = RunLimits(seconds=arguments.seconds)
+        limits = RunLimits(seconds=arguments.seconds, max_actions=arguments.max_actions)
     except ValueError as error:
         parser.error(str(error))
     return arguments, limits
 
 
 if __name__ == "__main__":
-    execute(*parse_arguments())
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    result = execute(*parse_arguments())
+    raise SystemExit(1 if result["status"] in ("failed", "incomplete") else 0)
