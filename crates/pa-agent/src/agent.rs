@@ -101,6 +101,8 @@ pub struct AgentOptions {
     pub steering_mode: Option<QueueMode>,
     pub follow_up_mode: Option<QueueMode>,
     pub session_id: Option<String>,
+    /// The transport every request of this agent asks for (TS `AgentOptions.transport`).
+    pub transport: Option<crate::types::Transport>,
     pub tool_execution: Option<ToolExecutionMode>,
     /// The inline-bash promotion window in milliseconds: an inline `bash`
     /// tool call still running after this long is promoted to a background
@@ -362,6 +364,7 @@ struct AgentInner {
     /// await.
     model_override: Mutex<Option<AgentModelOverride>>,
     session_id: Option<String>,
+    transport: Option<crate::types::Transport>,
     tool_execution: ToolExecutionMode,
     /// The resolved inline-bash promotion window (zero disables).
     auto_background_after: std::time::Duration,
@@ -582,6 +585,7 @@ impl AgentInner {
         config.max_tokens = None;
         config.reasoning = reasoning;
         config.session_id.clone_from(&self.session_id);
+        config.transport = self.transport;
         config.transform_context.clone_from(&self.transform_context);
         config.get_api_key.clone_from(&self.get_api_key);
         config.should_stop_after_turn = should_stop_after_turn;
@@ -824,6 +828,7 @@ impl Agent {
             message_end_transform: Mutex::new(None),
             model_override: Mutex::new(None),
             session_id: options.session_id,
+            transport: options.transport,
             tool_execution: options
                 .tool_execution
                 .unwrap_or(ToolExecutionMode::Parallel),
@@ -874,6 +879,12 @@ impl Agent {
         shared
             .listeners
             .retain(|(listener_id, _)| *listener_id != id);
+    }
+
+    /// The session identity every request of this agent carries.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.inner.session_id.as_deref()
     }
 
     pub async fn state(&self) -> AgentStateSnapshot {
