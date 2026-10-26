@@ -1,7 +1,6 @@
-//! The compact-trigger auto-refine scheduling (TS `_scheduleAutoRefineAfterCompaction`, armed
-//! after every successful compaction): the daemon worker services the trigger off each turn's
-//! settle in a background task (the inline-before-`Done` shape held the next prompt behind the
-//! whole review); ACP consumes it at the serialized checkpoint between turns.
+//! Shared compact/interval review scheduling. The worker services pending reviews
+//! after a run settles; an interval yield also services them between tool turns
+//! before resuming the same prompt.
 
 use pa_core::refinement::RefinementResult;
 use pa_core::session_engine::auto_refine_trigger::CompactAutoRefineSurface;
@@ -9,8 +8,7 @@ use pa_core::session_engine::auto_refine_trigger::CompactAutoRefineSurface;
 use crate::agent_engine::AgentSessionEngine;
 
 impl AgentSessionEngine {
-    /// Whether a compaction armed the compact-trigger review on the built
-    /// session (TS `_compactAutoRefinePending`).
+    /// Whether the built session has an armed compaction or a due interval review.
     pub(crate) fn compact_auto_refine_pending(&self) -> bool {
         let guard = self.session.blocking_lock();
         match guard.as_deref() {
@@ -28,16 +26,6 @@ impl AgentSessionEngine {
         if let Some(engine) = guard.as_deref() {
             self.runtime
                 .block_on(async { engine.session.mark_compact_auto_refine_pending() });
-        }
-    }
-
-    /// Count one settled non-error assistant turn into the review prompt's
-    /// turn line (TS `_assistantTurnsSinceAutoRefine`'s `message_end` increment).
-    pub(crate) fn note_settled_turn_since_auto_refine_review(&self) {
-        let guard = self.session.blocking_lock();
-        if let Some(engine) = guard.as_deref() {
-            self.runtime
-                .block_on(async { engine.session.note_settled_turn_since_auto_refine_review() });
         }
     }
 
@@ -413,6 +401,57 @@ mod tests {
             Some("third reply"),
             "the review consumed the queued decline"
         );
+    }
+
+    #[test]
+    fn interval_review_at_25_tool_turns_resumes_the_same_daemon_prompt() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut responses = Vec::new();
+        for index in 0..25 {
+            responses.push(json!({"content": [{
+                "type":"toolCall", "id":format!("probe-{index}"),
+                "name":"unavailable_fixture_tool", "arguments":{}
+            }]}));
+        }
+        responses.extend([
+            json!({"text": r#"{"shouldRefine":true,"rationale":"repeated failures"}"#}),
+            json!({"text": r#"{"summary":"lesson","edits":[{"action":"create","kind":"memory","id":"interval","title":"Lesson","content":"Use available tools."}]}"#}),
+            json!({"text":"finished after review"}),
+        ]);
+        let (engine, dir) = trigger_engine(&json!({"responses":responses}), 1, true);
+        std::fs::write(
+            dir.path().join("agent/settings.json"),
+            json!({"compaction":{"enabled":false},"autoRefine":{"compact":false}}).to_string(),
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        admit(&engine, "one prompt".into(), &mut events);
+        assert_eq!(
+            assistant_texts(&events).last().map(String::as_str),
+            Some("finished after review")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::AssistantMessage(_)))
+                .count(),
+            26
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::RefineComplete { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(refinement_rows(&events).len(), 2);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            EngineEvent::CompactionStart { .. } | EngineEvent::RefineFailed { .. }
+        )));
+        assert!(!engine.compact_auto_refine_pending());
     }
 
     #[test]

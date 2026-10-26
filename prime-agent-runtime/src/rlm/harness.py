@@ -27,6 +27,7 @@ from uuid import uuid4
 from typing import Any, Literal
 
 from .factory import require_factory_enabled, validate_factory_spec
+from . import harness_snapshots
 
 if sys.platform == "darwin":
     import fcntl
@@ -624,7 +625,7 @@ class HarnessState:
             return None
         return target
 
-    def save(self) -> "HarnessState":
+    def save(self, *, source: str = "agent_crud", refinement_id: str | None = None) -> "HarnessState":
         _require_refinements_enabled()
         if self.file_path is None:
             # in_memory fallback: nothing to persist.
@@ -673,6 +674,14 @@ class HarnessState:
         finally:
             temp_path.unlink(missing_ok=True)
         self._loaded_mtime = self._disk_mtime()
+        harness_snapshots.record(
+            target_path,
+            data,
+            scope=self.scope,
+            source=source,
+            session_id=_env_dir("RLM_SESSION_ID"),
+            refinement_id=refinement_id,
+        )
         return self
 
     def upsert(
@@ -1186,7 +1195,7 @@ class HarnessState:
                 outcome=outcome,
             )
             self.refinements.append(event)
-            self.save()
+            self.save(source="agent_record_refinement", refinement_id=event.id)
             return event
 
     def plan_refinement(

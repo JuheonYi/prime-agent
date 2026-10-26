@@ -139,11 +139,11 @@ pub struct AgentSession {
     /// engine wiring resolves it.
     auto_refine_allowed: bool,
     refinement_settings: Option<crate::settings::SettingsManager>,
-    /// The resolved auto-refine gates; the compact trigger reads them.
+    /// The resolved compact and interval auto-refine gates.
     auto_refine: refine::AutoRefineGates,
     /// Session-side auto-refine state the transport surfaces arm and
     /// consume.
-    compact_auto_refine: std::sync::Mutex<auto_refine_trigger::CompactAutoRefineState>,
+    compact_auto_refine: Arc<std::sync::Mutex<auto_refine_trigger::CompactAutoRefineState>>,
     /// The kernel-state probe behind the post-compaction
     /// `ipython_state` notice; `None` without a kernel.
     kernel_state: Option<std::sync::Arc<dyn ipython_state::CompactionKernelProbe>>,
@@ -243,7 +243,7 @@ impl AgentSession {
             auto_refine_allowed: false,
             refinement_settings: None,
             auto_refine: refine::AutoRefineGates::default(),
-            compact_auto_refine: std::sync::Mutex::default(),
+            compact_auto_refine: Arc::default(),
             kernel_state: None,
             pending_next_turn_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             skills: Vec::new(),

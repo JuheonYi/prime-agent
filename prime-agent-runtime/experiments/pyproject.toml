@@ -1,0 +1,8 @@
+[project]
+name = "prime-agent-harness-experiments"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "arc-agi==0.9.9",
+  "prolong-agent @ git+https://github.com/alexisfox7/PRO-LONG.git@9d2f2d46fea8759ed494ce5b0166c7004a2e97c4#subdirectory=research/arc-agi-3",
+]

@@ -397,14 +397,9 @@ impl AgentSession {
         api_key: Option<String>,
         global_harness_dir: std::path::PathBuf,
     ) -> anyhow::Result<crate::refinement::RefinementResult> {
-        self.refine_with_refiner(
-            options,
-            source,
-            model,
-            refine::default_refiner_call(api_key),
-            global_harness_dir,
-        )
-        .await
+        let refine_call = self.default_refiner_call(api_key);
+        self.refine_with_refiner(options, source, model, refine_call, global_harness_dir)
+            .await
     }
 
     /// [`Self::refine`] with an injected refiner call: the seam the parity
@@ -417,6 +412,9 @@ impl AgentSession {
         refine_call: crate::refinement::executor::RefinerFn,
         global_harness_dir: std::path::PathBuf,
     ) -> anyhow::Result<crate::refinement::RefinementResult> {
+        if source != refine::RefinementSource::Auto {
+            self.note_explicit_refinement();
+        }
         // The flight serializes every live-context replacer against a
         // compaction's rebuild: this round's outcome rows persist and then
         // push onto the context the compaction replaces, so the push must
@@ -432,6 +430,11 @@ impl AgentSession {
         } = parts.await?;
         let (result, context_row_ids) = {
             let mut session = self.session.lock().await;
+            let local_dir = self
+                .harness_digest
+                .as_ref()
+                .and_then(|context| context.local_dir.clone())
+                .unwrap_or_else(|| refine::local_harness_state_dir(&session));
             // The factory opt-in resolves at apply time, not here: the
             // agent dir (the same settings.json the kernel-side factory
             // gate reads) rides down to the refinement, which re-reads
@@ -454,6 +457,7 @@ impl AgentSession {
                 source,
                 refine_call,
                 self.agent_dir.as_deref(),
+                local_dir,
             )
             .await?
         };

@@ -39,18 +39,6 @@ type EventSink = std::sync::Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
 /// compact-trigger auto-refine bookkeeping, and the json/text output mode.
 pub(crate) struct TurnBoundary {
     recovery: OverflowRecovery,
-    /// A successful compaction schedules the compact-trigger auto-refine
-    /// review for the next serialized checkpoint (or the disposal drain).
-    compact_auto_refine_pending: bool,
-    /// (millis) Every review attempt — decline, success, or failure —
-    /// stamps the cooldown window.
-    last_auto_refine_review_at: Option<u64>,
-    /// The settled non-error, non-aborted assistant turns since the run's
-    /// start or the last review.
-    assistant_turns_since_review: u32,
-    /// The entry-count baseline the turn counter diffs against; set at
-    /// the first pre-turn check, so resumed history never counts.
-    entry_baseline: Option<usize>,
     /// json mode streams the session events on stdout; text mode reads
     /// the durable rows through the headless terminal result.
     json_mode: bool,
@@ -61,10 +49,6 @@ impl TurnBoundary {
     pub(crate) fn new(json_mode: bool) -> Self {
         Self {
             recovery: OverflowRecovery::Idle,
-            compact_auto_refine_pending: false,
-            last_auto_refine_review_at: None,
-            assistant_turns_since_review: 0,
-            entry_baseline: None,
             json_mode,
             sink: std::sync::Arc::new(|event| println!("{event}")),
         }
@@ -76,10 +60,6 @@ impl TurnBoundary {
     pub(crate) fn with_sink(json_mode: bool, sink: EventSink) -> Self {
         Self {
             recovery: OverflowRecovery::Idle,
-            compact_auto_refine_pending: false,
-            last_auto_refine_review_at: None,
-            assistant_turns_since_review: 0,
-            entry_baseline: None,
             json_mode,
             sink,
         }
@@ -110,9 +90,6 @@ impl TurnBoundary {
         let outcome = self
             .overflow_recovery_attempt(engine, model, api_key.clone(), OverflowBoundary::PreTurn)
             .await?;
-        if self.entry_baseline.is_none() {
-            self.entry_baseline = Some(engine.session.entries().await.len());
-        }
         if matches!(outcome, OverflowOutcome::NotApplicable) {
             self.requested_and_threshold_arms(engine, model, api_key)
                 .await?;
@@ -130,15 +107,26 @@ impl TurnBoundary {
         api_key: Option<String>,
         global_harness_dir: PathBuf,
     ) -> Result<(), String> {
-        self.count_settled_turns(engine).await;
-        self.consume_compact_auto_refine(
-            engine,
-            model,
-            api_key.clone(),
-            global_harness_dir.clone(),
-            RefineSurface::Checkpoint,
-        )
-        .await?;
+        loop {
+            let yielded = engine.session.take_auto_refine_yield();
+            self.consume_compact_auto_refine(
+                engine,
+                model,
+                api_key.clone(),
+                global_harness_dir.clone(),
+                RefineSurface::Checkpoint,
+            )
+            .await?;
+            if !yielded {
+                break;
+            }
+            engine
+                .session
+                .agent()
+                .continue_run()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let arm_finished = loop {
             let outcome = self
                 .overflow_recovery_attempt(

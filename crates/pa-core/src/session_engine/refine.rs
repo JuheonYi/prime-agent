@@ -26,6 +26,21 @@ pub const REFINEMENT_NOTICE_CUSTOM_TYPE: &str = "refinement_notice";
 
 pub const AUTO_REFINE_COMPACT_REASON: &str = "compact";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoRefineReason {
+    Compact,
+    TurnInterval,
+}
+
+impl AutoRefineReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => AUTO_REFINE_COMPACT_REASON,
+            Self::TurnInterval => "turn_interval",
+        }
+    }
+}
+
 /// The resolved auto-refine gates: the settings block with the product
 /// defaults and clamps applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,14 +224,16 @@ pub fn load_refinement_history(
     crate::refinement::merge_refinement_history(&global, &session_entries)
 }
 
-/// The session's local harness state directory (under the session dir).
+/// The local harness directory under a persisted session's artifacts.
 ///
 /// # Panics
 ///
 /// The `expect` cannot fire: the mapping is total for `Some` session dirs.
 #[must_use]
 pub fn local_harness_state_dir(session: &SessionManager) -> PathBuf {
-    let session_dir = session.get_session_dir().to_path_buf();
+    let session_dir = session
+        .get_session_artifact_dir()
+        .unwrap_or_else(|| session.get_session_dir().to_path_buf());
     crate::refinement::get_local_harness_state_dir(Some(&session_dir))
         .expect("session dir always yields a local harness dir")
 }
@@ -268,6 +285,7 @@ pub async fn execute_refinement(
     refine_call: crate::refinement::executor::RefinerFn,
     agent_dir: Option<&Path>,
 ) -> anyhow::Result<RefinementResult> {
+    let local_dir = local_harness_state_dir(session);
     Ok(execute_refinement_with_rows(
         session,
         transcript,
@@ -277,6 +295,7 @@ pub async fn execute_refinement(
         source,
         refine_call,
         agent_dir,
+        local_dir,
     )
     .await?
     .0)
@@ -308,6 +327,7 @@ pub async fn execute_refinement_with_rows(
     source: RefinementSource,
     refine_call: crate::refinement::executor::RefinerFn,
     agent_dir: Option<&Path>,
+    local_harness_dir: PathBuf,
 ) -> anyhow::Result<(RefinementResult, Vec<String>)> {
     let settings = match agent_dir {
         Some(dir) => {
@@ -331,7 +351,10 @@ pub async fn execute_refinement_with_rows(
         messages,
         refinement_history,
     } = transcript;
-    let local_harness_dir = local_harness_state_dir(session);
+    let session_id = local_harness_dir
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().to_string());
     let core_options = CoreRefineOptions {
         global: options.global,
         instructions: options.instructions.clone(),
@@ -411,8 +434,22 @@ pub async fn execute_refinement_with_rows(
         }
         None => false,
     };
+    let snapshot_context = crate::refinement::SnapshotContext {
+        source: if options.rollback_id.is_some() {
+            "rollback"
+        } else {
+            match source {
+                RefinementSource::Auto => "auto_refine",
+                RefinementSource::User => "user_refine",
+                RefinementSource::SelfRefine => "agent_refine",
+            }
+        },
+        scope: target_scope,
+        session_id,
+        refinement_id: Some(plan.id.clone()),
+    };
     let (mut result, state_path) = tokio::task::spawn_blocking(move || {
-        try_update_harness_state(&target_dir, target_scope, |state| {
+        try_update_harness_state(&target_dir, &snapshot_context, |state| {
             anyhow::ensure!(
                 super::refinement_gate::enabled(settings.as_ref()),
                 "Harness refinements were disabled during planning; the result was discarded"
@@ -504,6 +541,26 @@ impl AgentSession {
         turns_since_last_review: u32,
         branch_version: u64,
     ) -> anyhow::Result<Option<AutoRefineReview>> {
+        self.review_auto_refine_for_reason(
+            AutoRefineReason::Compact,
+            model,
+            api_key,
+            global_harness_dir,
+            turns_since_last_review,
+            branch_version,
+        )
+        .await
+    }
+
+    pub(crate) async fn review_auto_refine_for_reason(
+        &self,
+        reason: AutoRefineReason,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+        global_harness_dir: &Path,
+        turns_since_last_review: u32,
+        branch_version: u64,
+    ) -> anyhow::Result<Option<AutoRefineReview>> {
         if !self.harness_refinements_enabled() {
             return Ok(None);
         }
@@ -511,8 +568,12 @@ impl AgentSession {
         // against, extracted under this lock from the retained rows.
         let (parts, merged_state, history) = {
             let session = self.session_handle().lock().await;
-            let local_state =
-                load_harness_state(&local_harness_state_dir(&session), HarnessScope::Local);
+            let local_dir = self
+                .harness_digest
+                .as_ref()
+                .and_then(|context| context.local_dir.clone())
+                .unwrap_or_else(|| local_harness_state_dir(&session));
+            let local_state = load_harness_state(&local_dir, HarnessScope::Local);
             let global_state = load_harness_state(global_harness_dir, HarnessScope::Global);
             (
                 session.refine_transcript_parts(),
@@ -533,10 +594,10 @@ impl AgentSession {
             &history,
             model,
             &AutoRefineReviewContext {
-                reason: AUTO_REFINE_COMPACT_REASON.to_string(),
+                reason: reason.as_str().to_string(),
                 turns_since_last_review,
             },
-            default_refiner_call(api_key.clone()),
+            self.default_refiner_call(api_key.clone()),
         )
         .await?;
         if !review.should_refine {
@@ -580,8 +641,14 @@ impl AgentSession {
             return Ok(None);
         };
         Ok(Some(
-            self.run_approved_refine(&review, model, api_key, global_harness_dir)
-                .await?,
+            self.run_approved_refine(
+                AutoRefineReason::Compact,
+                &review,
+                model,
+                api_key,
+                global_harness_dir,
+            )
+            .await?,
         ))
     }
 
@@ -589,6 +656,7 @@ impl AgentSession {
     /// review.
     pub(crate) async fn run_approved_refine(
         &self,
+        reason: AutoRefineReason,
         review: &AutoRefineReview,
         model: &pa_types::ai::Model,
         api_key: Option<String>,
@@ -596,7 +664,7 @@ impl AgentSession {
     ) -> anyhow::Result<RefinementResult> {
         let options = RefineOptions {
             global: false,
-            instructions: Some(auto_refine_instructions(AUTO_REFINE_COMPACT_REASON, review)),
+            instructions: Some(auto_refine_instructions(reason.as_str(), review)),
             rollback_id: None,
         };
         self.refine(
@@ -608,33 +676,85 @@ impl AgentSession {
         )
         .await
     }
+    /// Resolve extra headers while preserving the original minimum reasoning policy.
+    pub(crate) fn default_refiner_call(
+        &self,
+        api_key: Option<String>,
+    ) -> crate::refinement::executor::RefinerFn {
+        let auxiliary_context = self.auxiliary_model.clone();
+        Box::new(move |model, system_prompt, prompt| {
+            Box::pin(async move {
+                let resolved = if let Some(auxiliary_context) = auxiliary_context {
+                    let request_model = model.clone();
+                    tokio::task::spawn_blocking(move || {
+                        super::auxiliary_model::session_fallback_with_headers(
+                            &auxiliary_context,
+                            &request_model,
+                            api_key,
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("refiner request settings task failed: {error}")
+                    })?
+                } else {
+                    super::auxiliary_model::ResolvedAuxiliaryModel {
+                        model: model.clone(),
+                        api_key,
+                        headers: model.headers.clone(),
+                    }
+                };
+                let mut stream_options =
+                    pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
+                        api_key: resolved.api_key,
+                        headers: resolved
+                            .headers
+                            .map(|headers| headers.into_iter().collect()),
+                        ..Default::default()
+                    });
+                stream_options.reasoning = pa_types::ai::minimum_reasoning(&model);
+                complete_refiner_call(&model, system_prompt, prompt, stream_options).await
+            })
+        })
+    }
 }
 
-/// The default model seam over pa-ai completion.
-#[must_use]
+/// Standalone refiner seam for callers without session request settings.
+/// Session-owned refinement uses the live session's headers and reasoning instead.
 pub fn default_refiner_call(api_key: Option<String>) -> crate::refinement::executor::RefinerFn {
     Box::new(move |model, system_prompt, prompt| {
-        let api_key = api_key;
         Box::pin(async move {
-            let context = pa_types::ai::Context {
-                system_prompt: Some(system_prompt.to_string()),
-                messages: vec![pa_types::ai::Message::User(UserMessage {
-                    content: UserContent::Text(prompt),
-                    timestamp: 0,
-                    rest: serde_json::Map::default(),
-                })],
-                tools: None,
-            };
-            let mut stream_options =
+            let mut options =
                 pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
                     api_key,
                     ..Default::default()
                 });
-            stream_options.reasoning = pa_types::ai::minimum_reasoning(&model);
-            Ok(pa_ai::complete_simple(&model, &context, Some(stream_options)).await?)
+            options.reasoning = pa_types::ai::minimum_reasoning(&model);
+            complete_refiner_call(&model, system_prompt, prompt, options).await
         })
     })
 }
+
+async fn complete_refiner_call(
+    model: &pa_types::ai::Model,
+    system_prompt: &str,
+    prompt: String,
+    options: pa_ai::types::SimpleStreamOptions,
+) -> anyhow::Result<pa_types::ai::AssistantMessage> {
+    let context = pa_types::ai::Context {
+        system_prompt: Some(system_prompt.to_string()),
+        messages: vec![pa_types::ai::Message::User(UserMessage {
+            content: UserContent::Text(prompt),
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        })],
+        tools: None,
+    };
+    Ok(pa_ai::complete_simple(model, &context, Some(options)).await?)
+}
+
+#[cfg(test)]
+mod request_settings_tests;
 
 #[cfg(test)]
 mod tests {
@@ -723,6 +843,127 @@ mod tests {
             timestamp: 0,
             rest: serde_json::Map::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn every_refinement_source_uses_the_session_artifact_store() {
+        let dir = TempDir::new().unwrap();
+        let mut session = persisted_session(&dir);
+        let other = persisted_session(&dir);
+        let local_dir = local_harness_state_dir(&session);
+        assert_ne!(local_dir, local_harness_state_dir(&other));
+        assert_eq!(
+            Some(local_dir.clone()),
+            super::super::harness_digest::local_harness_dir_for_log(
+                session.get_session_file().unwrap()
+            )
+        );
+        let global_dir = dir.path().join("global-harness");
+        let mut last_result = None;
+        for (index, (source, label)) in [
+            (RefinementSource::SelfRefine, "agent_refine"),
+            (RefinementSource::Auto, "auto_refine"),
+            (RefinementSource::User, "user_refine"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let proposal = json!({
+                "summary": label,
+                "edits": [{
+                    "action": if index == 0 { "create" } else { "update" },
+                    "kind": "memory", "id": "lesson", "title": "Lesson", "content": label
+                }]
+            });
+            let result = execute_refinement(
+                &mut session,
+                RefinementTranscript {
+                    messages: &[],
+                    refinement_history: &[],
+                },
+                &global_dir,
+                &test_model(),
+                &RefineOptions::default(),
+                source,
+                seam(&proposal.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                Path::new(&result.harness_state_path),
+                local_dir.join("harness_state.json")
+            );
+            let state = load_harness_state(&local_dir, HarnessScope::Local);
+            assert_eq!(
+                state.entries[&crate::refinement::RefinementKind::Memory]["lesson"].content,
+                label
+            );
+            last_result = Some(result);
+        }
+        let history = vec![last_result.unwrap()];
+        let rolled = execute_refinement(
+            &mut session,
+            RefinementTranscript {
+                messages: &[],
+                refinement_history: &history,
+            },
+            &global_dir,
+            &test_model(),
+            &RefineOptions {
+                rollback_id: Some(history[0].id.clone()),
+                ..Default::default()
+            },
+            RefinementSource::User,
+            Box::new(|_, _, _| panic!("rollback must not request a model")),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rolled.rollback_of.as_deref(), Some(history[0].id.as_str()));
+        let state = load_harness_state(&local_dir, HarnessScope::Local);
+        assert_eq!(
+            state.entries[&crate::refinement::RefinementKind::Memory]["lesson"].content,
+            "auto_refine"
+        );
+        assert!(!global_dir.join("harness_state.json").exists());
+        assert!(!local_harness_state_dir(&other).exists());
+        assert!(!session.get_session_dir().join("harness").exists());
+    }
+
+    #[tokio::test]
+    async fn daemon_refinement_uses_the_digest_directory_not_the_shared_session_directory() {
+        let dir = TempDir::new().unwrap();
+        let shared = dir.path().join("sessions");
+        let mut session = SessionManager::in_memory_in_session_dir(dir.path(), &shared);
+        let local = dir.path().join("session-artifacts/durable-session/harness");
+        let reply = r#"{"summary":"lesson","edits":[{"action":"create","kind":"memory","id":"m1","title":"Lesson","content":"daemon-local"}]}"#;
+        let (result, _) = execute_refinement_with_rows(
+            &mut session,
+            RefinementTranscript {
+                messages: &[],
+                refinement_history: &[],
+            },
+            &dir.path().join("global-harness"),
+            &test_model(),
+            &RefineOptions::default(),
+            RefinementSource::Auto,
+            seam(reply),
+            None,
+            local.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Path::new(&result.harness_state_path),
+            local.join("harness_state.json")
+        );
+        assert!(!shared.join("harness").exists());
+        let state = load_harness_state(&local, HarnessScope::Local);
+        assert_eq!(
+            state.entries[&crate::refinement::RefinementKind::Memory]["m1"].content,
+            "daemon-local"
+        );
     }
 
     #[tokio::test]
@@ -877,9 +1118,7 @@ Reviewer instructions: record it"
             disabled.applied_edits[0].error.as_deref(),
             Some(crate::refinement::FACTORY_DISABLED_MESSAGE)
         );
-        let harness_dir =
-            crate::refinement::get_local_harness_state_dir(Some(session.get_session_dir()))
-                .unwrap();
+        let harness_dir = local_harness_state_dir(&session);
         let state = load_harness_state(&harness_dir, HarnessScope::Local);
         assert!(state.entries[&crate::refinement::RefinementKind::Factory].is_empty());
         // The user opts in: the same proposal applies, read live from the
@@ -950,9 +1189,7 @@ Reviewer instructions: record it"
             turned_off.applied_edits[0].error.as_deref(),
             Some(crate::refinement::FACTORY_DISABLED_MESSAGE)
         );
-        let harness_dir =
-            crate::refinement::get_local_harness_state_dir(Some(session.get_session_dir()))
-                .unwrap();
+        let harness_dir = local_harness_state_dir(&session);
         let state = load_harness_state(&harness_dir, HarnessScope::Local);
         assert!(state.entries[&crate::refinement::RefinementKind::Factory].is_empty());
         // Authored while disabled; the request opts in.
@@ -1004,9 +1241,7 @@ Reviewer instructions: record it"
         assert!(result.applied_edits[0].applied);
         let state_path = Path::new(&result.harness_state_path);
         assert!(state_path.exists());
-        let harness_dir =
-            crate::refinement::get_local_harness_state_dir(Some(session.get_session_dir()))
-                .unwrap();
+        let harness_dir = local_harness_state_dir(&session);
         let state = load_harness_state(&harness_dir, HarnessScope::Local);
         assert!(state.entries[&crate::refinement::RefinementKind::Memory].contains_key("m1"));
         let entries = session.get_all_entries().to_vec();
@@ -1060,9 +1295,7 @@ Reviewer instructions: record it"
             error.to_string().contains("audit row not persisted"),
             "the audit error surfaces after the durable writes: {error:#}"
         );
-        let harness_dir =
-            crate::refinement::get_local_harness_state_dir(Some(session.get_session_dir()))
-                .unwrap();
+        let harness_dir = local_harness_state_dir(&session);
         let state = load_harness_state(&harness_dir, HarnessScope::Local);
         assert!(state.entries[&crate::refinement::RefinementKind::Memory].contains_key("m9"));
         // The notice is ordered after the audit rethrow.

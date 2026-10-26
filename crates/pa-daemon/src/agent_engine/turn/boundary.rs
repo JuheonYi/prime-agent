@@ -194,47 +194,62 @@ impl AgentSessionEngine {
             }
             None => {}
         }
-        match consumption.refinement {
-            Some(Ok(refinement)) => {
-                let outcome =
-                    pa_core::session_engine::refine::create_refinement_outcome_message(&refinement);
-                if !emit(EngineEvent::CustomMessage(
-                    crate::session_commands::custom_message_value(&outcome),
-                )) {
-                    return BoundaryRun::Cancelled;
-                }
-                if refinement.applied_edits.iter().any(|edit| edit.applied) {
-                    let notice = pa_core::session_engine::refine::create_refinement_notice_message(
-                        &refinement,
-                        pa_core::session_engine::refine::RefinementSource::SelfRefine,
-                    );
-                    if !emit(EngineEvent::CustomMessage(
-                        crate::session_commands::custom_message_value(&notice),
-                    )) {
-                        return BoundaryRun::Cancelled;
-                    }
-                }
-                if let Ok(result) = serde_json::to_value(&refinement) {
-                    if !emit(EngineEvent::RefineComplete { result }) {
-                        return BoundaryRun::Cancelled;
-                    }
-                }
-            }
-            Some(Err(error)) => {
-                eprintln!("pa-daemon: requested refinement failed: {error:#}");
-                if !emit(EngineEvent::RefineFailed {
-                    error: format!("{error:#}"),
-                }) {
-                    return BoundaryRun::Cancelled;
-                }
-            }
-            None => {}
+        if !Self::emit_refinement_outcome(
+            consumption.refinement.transpose(),
+            pa_core::session_engine::refine::RefinementSource::SelfRefine,
+            emit,
+        ) {
+            return BoundaryRun::Cancelled;
         }
         if stopped_for_compaction {
             BoundaryRun::StoppedForCompaction { compacted }
         } else {
             BoundaryRun::Proceed
         }
+    }
+
+    pub(super) fn emit_refinement_outcome(
+        result: anyhow::Result<Option<pa_core::refinement::RefinementResult>>,
+        source: pa_core::session_engine::refine::RefinementSource,
+        emit: &mut dyn FnMut(EngineEvent) -> bool,
+    ) -> bool {
+        match result {
+            Ok(Some(refinement)) => {
+                let outcome =
+                    pa_core::session_engine::refine::create_refinement_outcome_message(&refinement);
+                if !emit(EngineEvent::CustomMessage(
+                    crate::session_commands::custom_message_value(&outcome),
+                )) {
+                    return false;
+                }
+                if refinement.applied_edits.iter().any(|edit| edit.applied) {
+                    let notice = pa_core::session_engine::refine::create_refinement_notice_message(
+                        &refinement,
+                        source,
+                    );
+                    if !emit(EngineEvent::CustomMessage(
+                        crate::session_commands::custom_message_value(&notice),
+                    )) {
+                        return false;
+                    }
+                }
+                if let Ok(result) = serde_json::to_value(&refinement) {
+                    if !emit(EngineEvent::RefineComplete { result }) {
+                        return false;
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("pa-daemon: refinement failed: {error:#}");
+                if !emit(EngineEvent::RefineFailed {
+                    error: format!("{error:#}"),
+                }) {
+                    return false;
+                }
+            }
+            Ok(None) => {}
+        }
+        true
     }
 }
 

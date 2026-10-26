@@ -1807,3 +1807,165 @@ async fn overflow_error_with_compaction_disabled_ends_without_recovery() {
         .expect("the settled error turn");
     assert_eq!(last.error_message.as_deref(), Some(OVERFLOW_ERROR));
 }
+
+#[tokio::test]
+async fn interval_review_at_25_tool_turns_resumes_the_same_print_prompt() {
+    let _faux = FAUX_TEST_LOCK.lock().await;
+    let mut responses = Vec::new();
+    for index in 0..25 {
+        responses.push(json!({"content": [{
+            "type":"toolCall", "id":format!("probe-{index}"),
+            "name":"unavailable_fixture_tool", "arguments":{}
+        }]}));
+    }
+    responses.extend([
+        json!({"text": r#"{"shouldRefine":true,"rationale":"repeated failures"}"#}),
+        json!({"text": r#"{"summary":"lesson","edits":[{"action":"create","kind":"memory","id":"interval","title":"Lesson","content":"Use available tools."}]}"#}),
+        json!({"text":"finished after review"}),
+    ]);
+    let (engine, dir, model) = faux_engine_with_settings(
+        json!({"responses":responses}),
+        json!({"compaction":{"enabled":false},"autoRefine":{"compact":false}}),
+        None,
+    )
+    .await;
+    let (sink, events) = capture_sink();
+    let mut boundary = TurnBoundary::with_sink(true, sink);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            "one prompt".into(),
+            dir.path().join("global"),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        json!(last_assistant(&engine).await.unwrap())["content"][0]["text"],
+        "finished after review"
+    );
+    assert_eq!(compaction_count(&engine).await, 0);
+    assert_eq!(refine_rows(&engine).await.len(), 2);
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "refine_complete")
+            .count(),
+        1
+    );
+    let entries = engine.session.entries().await;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                FileEntry::Message {
+                    message: SessionAgentMessage::User(_),
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                FileEntry::Message {
+                    message: SessionAgentMessage::Assistant(_),
+                    ..
+                }
+            ))
+            .count(),
+        26
+    );
+    assert!(!engine.session.take_auto_refine_yield());
+}
+
+#[tokio::test]
+async fn interval_review_respects_both_disable_switches_in_a_tool_loop() {
+    let _faux = FAUX_TEST_LOCK.lock().await;
+    for settings in [
+        json!({"compaction":{"enabled":false},"autoRefine":{"enabled":false}}),
+        json!({"compaction":{"enabled":false},"harnessRefinements":false}),
+    ] {
+        let mut responses: Vec<_> = (0..25)
+            .map(|index| {
+                json!({"content":[{
+                    "type":"toolCall", "id":format!("probe-{index}"),
+                    "name":"unavailable_fixture_tool", "arguments":{}
+                }]})
+            })
+            .collect();
+        responses.push(json!({"text":"finished without review"}));
+        let (engine, dir, model) =
+            faux_engine_with_settings(json!({"responses":responses}), settings, None).await;
+        let mut boundary = TurnBoundary::new(false);
+        admit_with_harness_dir(
+            &mut boundary,
+            &engine,
+            &model,
+            "one prompt".into(),
+            dir.path().join("global"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            json!(last_assistant(&engine).await.unwrap())["content"][0]["text"],
+            "finished without review"
+        );
+        assert_eq!(refine_rows(&engine).await.len(), 0);
+        assert!(!engine.session.take_auto_refine_yield());
+    }
+}
+
+#[tokio::test]
+async fn interval_review_does_not_count_error_or_aborted_assistant_responses() {
+    let _faux = FAUX_TEST_LOCK.lock().await;
+    for stop_reason in ["error", "aborted"] {
+        let (engine, dir, model) = faux_engine_with_settings(
+            json!({"responses":[
+                {"text":"", "stopReason":stop_reason, "errorMessage":"fixture interruption"},
+                {"text":"first"},
+                {"text":"second"},
+                {"text":r#"{"shouldRefine":false,"rationale":"no reusable evidence"}"#},
+                {"text":"after review"},
+            ]}),
+            json!({"compaction":{"enabled":false},"autoRefine":{"turnInterval":2,"compact":false}}),
+            None,
+        )
+        .await;
+        let (sink, events) = capture_sink();
+        let mut boundary = TurnBoundary::with_sink(true, sink);
+        for expected in [None, Some("first"), Some("second"), Some("after review")] {
+            admit_with_harness_dir(
+                &mut boundary,
+                &engine,
+                &model,
+                "next turn".into(),
+                dir.path().join("global"),
+            )
+            .await
+            .unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(
+                    json!(last_assistant(&engine).await.unwrap())["content"][0]["text"],
+                    expected
+                );
+            }
+        }
+        assert_eq!(refine_rows(&engine).await.len(), 0);
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event["type"] == "refine_failed"));
+    }
+}

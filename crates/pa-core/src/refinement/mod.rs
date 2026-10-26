@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+mod snapshots;
+pub(crate) use snapshots::SnapshotContext;
+
 /// Refinement entry kinds (the continual harness component set).
 pub const REFINEMENT_KINDS: [&str; 5] = ["prompt", "memory", "skill", "subagent", "factory"];
 
@@ -280,6 +283,16 @@ pub fn save_harness_state(
     harness_state_dir: &Path,
     state: &HarnessState,
 ) -> anyhow::Result<PathBuf> {
+    let state_path = save_current_state(harness_state_dir, state)?;
+    snapshots::record(
+        &state_path,
+        state,
+        &SnapshotContext::host(HarnessScope::Global),
+    );
+    Ok(state_path)
+}
+
+fn save_current_state(harness_state_dir: &Path, state: &HarnessState) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(harness_state_dir)?;
     let state_path = get_harness_state_path(harness_state_dir);
     let content = format!("{}\n", serde_json::to_string_pretty(state)?);
@@ -302,13 +315,15 @@ pub fn update_harness_state<R>(
     scope: HarnessScope,
     update: impl FnOnce(&mut HarnessState) -> R,
 ) -> anyhow::Result<(R, PathBuf)> {
-    try_update_harness_state(harness_state_dir, scope, |state| Ok(update(state)))
+    try_update_harness_state(harness_state_dir, &SnapshotContext::host(scope), |state| {
+        Ok(update(state))
+    })
 }
 
 /// A rejected update must exit before saving, including an apply-time setting gate.
 pub(crate) fn try_update_harness_state<R>(
     harness_state_dir: &Path,
-    scope: HarnessScope,
+    context: &SnapshotContext,
     update: impl FnOnce(&mut HarnessState) -> anyhow::Result<R>,
 ) -> anyhow::Result<(R, PathBuf)> {
     std::fs::create_dir_all(harness_state_dir)?;
@@ -319,10 +334,11 @@ pub(crate) fn try_update_harness_state<R>(
         50,
         std::time::Duration::from_millis(20),
     )?;
-    let mut state = load_harness_state(harness_state_dir, scope);
+    let mut state = load_harness_state(harness_state_dir, context.scope);
     let result = update(&mut state)?;
     lock.ensure_owned()?;
-    let written = save_harness_state(harness_state_dir, &state)?;
+    let written = save_current_state(harness_state_dir, &state)?;
+    snapshots::record(&written, &state, context);
     Ok((result, written))
 }
 
@@ -606,11 +622,14 @@ mod tests {
         let state = empty_harness_state();
         let path = save_harness_state(dir.path(), &state).unwrap();
         let before = std::fs::read(&path).unwrap();
-        let result: anyhow::Result<((), PathBuf)> =
-            try_update_harness_state(dir.path(), HarnessScope::Global, |state| {
+        let result: anyhow::Result<((), PathBuf)> = try_update_harness_state(
+            dir.path(),
+            &SnapshotContext::host(HarnessScope::Global),
+            |state| {
                 state.schema = 99;
                 anyhow::bail!("disabled before commit")
-            });
+            },
+        );
         assert!(result.is_err());
         assert_eq!(std::fs::read(path).unwrap(), before);
     }

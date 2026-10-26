@@ -1,4 +1,4 @@
-//! The compact-trigger auto-refine machine: the session-side state and
+//! The compact/interval auto-refine machine: the session-side state and
 //! the one consumption order the servicing surfaces share — gates first,
 //! then the review, and only an approving review runs the refinement.
 
@@ -7,7 +7,7 @@ use pa_types::ai::Model;
 use crate::refinement::executor::AutoRefineReview;
 use crate::refinement::RefinementResult;
 
-use super::refine::{now_millis, AutoRefineRound};
+use super::refine::{now_millis, AutoRefineGates, AutoRefineReason, AutoRefineRound};
 use super::AgentSession;
 
 /// The boundary a pending trigger is serviced at.
@@ -37,7 +37,31 @@ pub(crate) struct CompactAutoRefineState {
     branch_version: u64,
     /// An approving review retained behind an active agent turn: the next
     /// serviced boundary runs its refinement without a new review call.
-    pending_review: Option<AutoRefineReview>,
+    pending_review: Option<(AutoRefineReason, AutoRefineReview)>,
+    yielded: bool,
+}
+
+impl CompactAutoRefineState {
+    pub(crate) fn note_settled_turn(&mut self) {
+        self.settled_turns_since_review = self.settled_turns_since_review.saturating_add(1);
+    }
+
+    pub(crate) fn interval_due(&self, gates: AutoRefineGates) -> bool {
+        gates.enabled
+            && u64::from(self.settled_turns_since_review) >= gates.turn_interval
+            && !self.in_flight
+            && self
+                .last_review_at
+                .is_none_or(|last| now_millis().saturating_sub(last) >= gates.cooldown_ms)
+    }
+
+    pub(crate) fn yield_for_interval(&mut self, gates: AutoRefineGates) -> bool {
+        if !self.interval_due(gates) {
+            return false;
+        }
+        self.yielded = true;
+        true
+    }
 }
 
 impl AgentSession {
@@ -57,7 +81,7 @@ impl AgentSession {
             .pending = true;
     }
 
-    /// Whether a trigger is armed or an approving review is retained:
+    /// Whether compaction is armed, an interval is due, or an approval is retained:
     /// the scheduling surfaces' cheap pre-check.
     ///
     /// # Panics
@@ -68,7 +92,9 @@ impl AgentSession {
             .compact_auto_refine
             .lock()
             .expect("compact auto-refine state lock");
-        state.pending || state.pending_review.is_some()
+        state.pending
+            || state.pending_review.is_some()
+            || state.interval_due(self.auto_refine_gates())
     }
 
     /// Whether the branch version is still the one the round captured:
@@ -98,7 +124,36 @@ impl AgentSession {
             .expect("compact auto-refine state lock");
         state.pending = false;
         state.pending_review = None;
+        state.settled_turns_since_review = 0;
+        state.yielded = false;
         state.branch_version += 1;
+    }
+
+    /// Whether the tool loop yielded to service an interval review.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the auto-refine state mutex is poisoned.
+    pub fn take_auto_refine_yield(&self) -> bool {
+        let mut state = self
+            .compact_auto_refine
+            .lock()
+            .expect("compact auto-refine state lock");
+        std::mem::take(&mut state.yielded)
+    }
+
+    pub(crate) fn note_explicit_refinement(&self) {
+        let mut state = self
+            .compact_auto_refine
+            .lock()
+            .expect("compact auto-refine state lock");
+        state.pending = false;
+        state.pending_review = None;
+        state.settled_turns_since_review = 0;
+        state.last_review_at = Some(now_millis());
+        if state.in_flight {
+            state.branch_version += 1;
+        }
     }
 
     /// # Panics
@@ -108,10 +163,10 @@ impl AgentSession {
         self.compact_auto_refine
             .lock()
             .expect("compact auto-refine state lock")
-            .settled_turns_since_review += 1;
+            .note_settled_turn();
     }
 
-    /// Consume the armed trigger at one boundary. `Ok(None)` is every silent
+    /// Consume a compact or interval trigger at one boundary. `Ok(None)` is every silent
     /// outcome; `Ok(Some(result))` ran the refinement; `Err` is a failed
     /// review or refinement run (cooldown stamped either way).
     ///
@@ -130,21 +185,31 @@ impl AgentSession {
         surface: CompactAutoRefineSurface,
     ) -> anyhow::Result<Option<RefinementResult>> {
         let gates = self.auto_refine_gates();
-        let (retained_review, settled_turns, branch_version) = {
+        let (reason, retained_review, settled_turns, branch_version) = {
             let mut state = self
                 .compact_auto_refine
                 .lock()
                 .expect("compact auto-refine state lock");
-            if !state.pending && state.pending_review.is_none() {
-                return Ok(None);
-            }
-            // Gate order: the refine surface, then the `enabled` gate, then the
-            // `compact` gate — a dropped trigger clears the flag and retained review.
-            if !self.auto_refine_allowed() || !gates.enabled || !gates.compact {
+            if !self.auto_refine_allowed() || !gates.enabled {
                 state.pending = false;
                 state.pending_review = None;
                 return Ok(None);
             }
+            if !gates.compact {
+                state.pending = false;
+                if matches!(state.pending_review, Some((AutoRefineReason::Compact, _))) {
+                    state.pending_review = None;
+                }
+            }
+            let reason = if let Some((reason, _)) = &state.pending_review {
+                *reason
+            } else if state.pending {
+                AutoRefineReason::Compact
+            } else if u64::from(state.settled_turns_since_review) >= gates.turn_interval {
+                AutoRefineReason::TurnInterval
+            } else {
+                return Ok(None);
+            };
             let under_cooldown = state
                 .last_review_at
                 .is_some_and(|last| now_millis().saturating_sub(last) < gates.cooldown_ms);
@@ -163,9 +228,10 @@ impl AgentSession {
             }
             // An approving review deferred behind an active turn runs
             // its refinement here without a new review model call.
-            if let Some(review) = state.pending_review.clone() {
+            if let Some((_, review)) = state.pending_review.clone() {
                 state.in_flight = true;
                 (
+                    reason,
                     Some(review),
                     state.settled_turns_since_review,
                     state.branch_version,
@@ -173,14 +239,19 @@ impl AgentSession {
             } else {
                 state.pending = false;
                 state.in_flight = true;
-                (None, state.settled_turns_since_review, state.branch_version)
+                (
+                    reason,
+                    None,
+                    state.settled_turns_since_review,
+                    state.branch_version,
+                )
             }
         };
         let outcome = if let Some(review) = retained_review.as_ref() {
             // The branch fence: a branch move since the retained round's start
             // dropped this review — the refinement never starts.
             if self.compact_auto_refine_branch_version_unchanged(branch_version) {
-                self.run_approved_refine(review, model, api_key, global_harness_dir)
+                self.run_approved_refine(reason, review, model, api_key, global_harness_dir)
                     .await
                     .map(AutoRefineRound::Ran)
             } else {
@@ -190,7 +261,8 @@ impl AgentSession {
             // The post-review active-agent gate: running the refinement mid-stream
             // stalls the admitted turn and swaps its context, so the approval is retained.
             match self
-                .review_compact_auto_refine(
+                .review_auto_refine_for_reason(
+                    reason,
                     model,
                     api_key.clone(),
                     &global_harness_dir,
@@ -208,9 +280,15 @@ impl AgentSession {
                         // round resolved against a bumped version never applies.
                         Ok(AutoRefineRound::Declined)
                     } else {
-                        self.run_approved_refine(&review, model, api_key, global_harness_dir)
-                            .await
-                            .map(AutoRefineRound::Ran)
+                        self.run_approved_refine(
+                            reason,
+                            &review,
+                            model,
+                            api_key,
+                            global_harness_dir,
+                        )
+                        .await
+                        .map(AutoRefineRound::Ran)
                     }
                 }
                 Err(error) => Err(error),
@@ -232,7 +310,7 @@ impl AgentSession {
             // A deferred round is not consumed: the review stays for the next
             // boundary, and neither the stamp nor the counter reset runs.
             if let Ok(AutoRefineRound::Deferred(review)) = &outcome {
-                state.pending_review = Some(review.clone());
+                state.pending_review = Some((reason, review.clone()));
                 return Ok(None);
             }
             // Every fresh attempt — decline, success, and failure
@@ -492,5 +570,121 @@ mod tests {
         assert!(!pending);
         assert!(last_review_at.is_some(), "the success stamped the cooldown");
         assert_eq!(turns, 0, "the counter reset");
+    }
+
+    #[tokio::test]
+    async fn interval_review_starts_at_25_turns_without_compaction() {
+        let mut session = session(true).await;
+        session.set_auto_refine(
+            true,
+            AutoRefineGates {
+                compact: false,
+                ..Default::default()
+            },
+        );
+        let model = faux_model(&[serde_json::json!({
+            "text": r#"{"shouldRefine":false,"rationale":"not reusable"}"#
+        })]);
+        for _ in 0..24 {
+            session.note_settled_turn_since_auto_refine_review();
+        }
+        assert!(!session.compact_auto_refine_pending());
+        assert!(
+            consume(&session, &model, CompactAutoRefineSurface::Checkpoint)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state(&session), (false, None, 24));
+        session.note_settled_turn_since_auto_refine_review();
+        assert!(session.compact_auto_refine_pending());
+        assert!(
+            consume(&session, &model, CompactAutoRefineSurface::Checkpoint)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(state(&session).1.is_some());
+        assert_eq!(state(&session).2, 0);
+    }
+
+    #[tokio::test]
+    async fn interval_review_obeys_cooldown_and_remains_due_after_expiry() {
+        let session = session(true).await;
+        let review = serde_json::json!({"text": r#"{"shouldRefine":false,"rationale":"no"}"#});
+        let model = faux_model(&[review.clone(), review]);
+        for _ in 0..25 {
+            session.note_settled_turn_since_auto_refine_review();
+        }
+        consume(&session, &model, CompactAutoRefineSurface::Checkpoint)
+            .await
+            .unwrap();
+        let first_review = state(&session).1;
+        for _ in 0..25 {
+            session.note_settled_turn_since_auto_refine_review();
+        }
+        consume(&session, &model, CompactAutoRefineSurface::Checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(state(&session), (false, first_review, 25));
+        session.compact_auto_refine.lock().unwrap().last_review_at = Some(0);
+        consume(&session, &model, CompactAutoRefineSurface::Checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(state(&session).2, 0);
+        assert_ne!(state(&session).1, Some(0));
+    }
+
+    #[tokio::test]
+    async fn interval_gate_and_explicit_refinement_prevent_duplicate_reviews() {
+        for (allowed, enabled) in [(false, true), (true, false), (true, true)] {
+            let mut session = session(true).await;
+            session.set_auto_refine(
+                allowed,
+                AutoRefineGates {
+                    enabled,
+                    ..Default::default()
+                },
+            );
+            for _ in 0..25 {
+                session.note_settled_turn_since_auto_refine_review();
+            }
+            if allowed && enabled {
+                session.mark_compact_auto_refine_pending();
+                session.note_explicit_refinement();
+            }
+            let model = faux_model(&[serde_json::json!({"text":"must not request a review"})]);
+            consume(&session, &model, CompactAutoRefineSurface::Checkpoint)
+                .await
+                .unwrap();
+            if allowed && enabled {
+                assert_eq!(state(&session).2, 0);
+                assert!(!session.compact_auto_refine_pending());
+            } else {
+                assert!(state(&session).1.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn coincident_compaction_and_interval_are_consumed_by_one_review() {
+        let session = session(true).await;
+        for _ in 0..25 {
+            session.note_settled_turn_since_auto_refine_review();
+        }
+        session.mark_compact_auto_refine_pending();
+        let model = faux_model(&[serde_json::json!({
+            "text": r#"{"shouldRefine":false,"rationale":"no"}"#
+        })]);
+        consume(&session, &model, CompactAutoRefineSurface::Checkpoint)
+            .await
+            .unwrap();
+        let after = state(&session);
+        consume(&session, &model, CompactAutoRefineSurface::Checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(state(&session), after);
+        assert_eq!(after.2, 0);
+        assert!(!after.0);
     }
 }

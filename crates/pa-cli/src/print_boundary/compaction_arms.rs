@@ -80,7 +80,7 @@ impl TurnBoundary {
                 }
                 // Every successful compaction schedules the compact-trigger
                 // auto-refine for the next checkpoint (or the disposal drain).
-                self.compact_auto_refine_pending = true;
+                engine.session.mark_compact_auto_refine_pending();
                 self.emit_ipython_state_row(&run);
                 self.emit_json(&compaction_end_success_event(
                     CompactionOutcomeReason::Requested.wire(),
@@ -130,7 +130,7 @@ impl TurnBoundary {
                             if let Some(telemetry) = engine.telemetry.as_ref() {
                                 telemetry.note_compaction(Some(run.duration_ms));
                             }
-                            self.compact_auto_refine_pending = true;
+                            engine.session.mark_compact_auto_refine_pending();
                             self.emit_ipython_state_row(&run);
                             self.emit_json(&compaction_end_success_event(
                                 CompactionOutcomeReason::Threshold.wire(),
@@ -253,7 +253,7 @@ impl TurnBoundary {
             .await;
         match outcome {
             Ok(CompactOutcome::Ran(run)) => {
-                self.compact_auto_refine_pending = true;
+                engine.session.mark_compact_auto_refine_pending();
                 self.emit_ipython_state_row(&run);
                 if let Some(telemetry) = engine.telemetry.as_ref() {
                     telemetry.note_compaction(Some(run.duration_ms));

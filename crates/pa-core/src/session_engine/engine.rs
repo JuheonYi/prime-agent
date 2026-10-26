@@ -696,6 +696,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         }
         None => timing_stream_fn,
     };
+    let auto_refine_state = Arc::new(std::sync::Mutex::new(
+        super::auto_refine_trigger::CompactAutoRefineState::default(),
+    ));
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
             system_prompt: Some(system_prompt.clone()),
@@ -721,17 +724,45 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         should_stop_after_turn: {
             let steering = config.queued_steering_probe.take();
             let boundary = config.should_stop_after_turn.take();
+            let state = Arc::clone(&auto_refine_state);
+            let refinement_settings = Arc::new(refinement_settings.reopen());
+            let requests = Arc::clone(&turn_boundary);
             Some(std::sync::Arc::new(move |context| {
                 let steering = steering.clone();
                 let boundary = boundary.clone();
+                let state = Arc::clone(&state);
+                let settings = Arc::clone(&refinement_settings);
+                let requests = Arc::clone(&requests);
                 Box::pin(async move {
+                    let has_tools = !context.tool_results.is_empty();
                     if steering.as_ref().is_some_and(|probe| probe()) {
                         return Ok(true);
                     }
-                    match boundary {
-                        Some(hook) => hook(context).await,
-                        None => Ok(false),
+                    if let Some(hook) = boundary {
+                        if hook(context).await? {
+                            return Ok(true);
+                        }
                     }
+                    if !auto_refine_allowed
+                        || !has_tools
+                        || !state
+                            .lock()
+                            .expect("compact auto-refine state lock")
+                            .interval_due(auto_refine_gates)
+                        || requests.compaction_scheduled().await
+                        || requests.refine_pending().await
+                    {
+                        return Ok(false);
+                    }
+                    let enabled = tokio::task::spawn_blocking(move || {
+                        super::refinement_gate::enabled(Some(&settings))
+                    })
+                    .await?;
+                    Ok(enabled
+                        && state
+                            .lock()
+                            .expect("compact auto-refine state lock")
+                            .yield_for_interval(auto_refine_gates))
                 })
             }))
         },
@@ -781,6 +812,33 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         &wiring.session,
     )));
     session.set_auto_refine(auto_refine_allowed, auto_refine_gates);
+    let counted_turns = Arc::clone(&auto_refine_state);
+    agent
+        .subscribe(move |event, _signal| {
+            let counted_turns = Arc::clone(&counted_turns);
+            Box::pin(async move {
+                if let pa_agent::types::AgentEvent::MessageEnd {
+                    message:
+                        pa_agent::types::AgentMessage::Standard(pa_agent::types::Message::Assistant(
+                            message,
+                        )),
+                } = event
+                {
+                    if !matches!(
+                        message.stop_reason,
+                        pa_agent::types::StopReason::Error | pa_agent::types::StopReason::Aborted
+                    ) {
+                        counted_turns
+                            .lock()
+                            .expect("compact auto-refine state lock")
+                            .note_settled_turn();
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await;
+    session.compact_auto_refine = auto_refine_state;
     session.set_agent_dir(config.agent_dir.clone());
     // Keep the context descriptor even while disabled, so re-enabling can load it.
     session.harness_digest = Some(digest_context);

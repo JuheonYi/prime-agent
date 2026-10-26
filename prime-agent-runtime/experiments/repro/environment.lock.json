@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "baseline_upstream_commit": "71beca9478f552dc6fc898bba9685f9ce00515cf",
+  "platform": {"system": "Linux", "machine": "x86_64", "distribution": "ubuntu", "version": "24.04", "glibc": "2.39"},
+  "system_packages": {
+    "bubblewrap": "0.9.0-1ubuntu0.3",
+    "python3.12": "3.12.3-1ubuntu0.17",
+    "libc6": "2.39-0ubuntu8.9",
+    "build-essential": "12.10ubuntu1",
+    "pkg-config": "1.8.1-2build1",
+    "libssl-dev": "3.0.13-0ubuntu3.16",
+    "ca-certificates": "20260816ubuntu0.24.04.1",
+    "curl": "8.5.0-2ubuntu10.16",
+    "git": "1:2.43.0-1ubuntu7.4"
+  },
+  "uv": {
+    "version": "0.9.18",
+    "url": "https://github.com/astral-sh/uv/releases/download/0.9.18/uv-x86_64-unknown-linux-gnu.tar.gz",
+    "sha256": "c2def3db178ade63933fa15ffc96e882c196ce53e06173dcee05b36c5f6f68f5",
+    "binary_sha256": "7f73d66b9767a281c2cae604b7cd0b6eaa1f0dda5ae28b9067e6de745d9593eb"
+  },
+  "rust": {
+    "version": "1.99.1",
+    "profile": "debug",
+    "rustup_url": "https://static.rust-lang.org/rustup/archive/1.29.2/x86_64-unknown-linux-gnu/rustup-init",
+    "rustup_sha256": "5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4"
+  },
+  "python": {"arc": "3.12.3", "kernel": "3.11.14"},
+  "kernel_interpreter_sha256": "d41b33aaed48160ca115bc4436a8f2593287851bf649b66c1193f0a1d7e8a426",
+  "local_kernel_packages": [
+    {"name": "prime-agent-runtime", "version": "0.1.0", "path": "prime-agent-runtime", "module": "rlm", "editable": false},
+    {"name": "agent-message", "version": "0.1.0", "path": "skills/agent-message", "module": "agent_message", "editable": true},
+    {"name": "compact", "version": "0.1.0", "path": "skills/compact", "module": "compact", "editable": true},
+    {"name": "edit", "version": "0.1.0", "path": "skills/edit", "module": "edit", "editable": true},
+    {"name": "goal", "version": "0.1.0", "path": "skills/goal", "module": "goal", "editable": true},
+    {"name": "prime-agent-skill-attach-image", "version": "0.1.0", "path": "skills/attach-image", "module": "attach_image", "editable": true},
+    {"name": "refine", "version": "0.1.0", "path": "skills/refine", "module": "refine", "editable": true}
+  ],
+  "unavailable_kernel_modules": ["agent_observe", "rlm_heartbeat"],
+  "arc_packages": {
+    "annotated-types": "0.8.0",
+    "arc-agi": "0.9.9",
+    "arcengine": "0.9.3",
+    "blinker": "1.9.0",
+    "certifi": "2026.10.23",
+    "charset-normalizer": "3.5.2",
+    "click": "8.5.0",
+    "contourpy": "1.4.0",
+    "cycler": "0.12.1",
+    "flask": "3.1.3",
+    "fonttools": "4.67.0",
+    "idna": "3.20",
+    "itsdangerous": "2.2.0",
+    "jinja2": "3.1.6",
+    "kiwisolver": "1.5.1",
+    "markupsafe": "3.0.4",
+    "matplotlib": "3.11.2",
+    "numpy": "2.5.4",
+    "packaging": "26.3",
+    "pillow": "13.0.0",
+    "prolong-agent": "0.1.0",
+    "pydantic": "2.14.1",
+    "pydantic-core": "2.50.1",
+    "pyparsing": "3.3.3",
+    "python-dateutil": "3.0.0",
+    "python-dotenv": "1.2.4",
+    "requests": "2.34.2",
+    "six": "1.17.0",
+    "typing-inspection": "0.4.4",
+    "typing-extensions": "4.16.0",
+    "tzdata": "2026.5",
+    "urllib3": "2.8.0",
+    "werkzeug": "3.1.9"
+  },
+  "prolong_revision": "9d2f2d46fea8759ed494ce5b0166c7004a2e97c4",
+  "games": [
+    {"id": "ls20-9607627b", "source": "ls20.py", "sha256": "298c810da2850d557c95d92a2cbd846df29a45d7134e20888617bedf5dafcd92",
+     "metadata": {"title": "LS20", "default_fps": 30, "tags": ["keyboard"], "baseline_actions": [22, 123, 73, 84, 96, 192, 186]}},
+    {"id": "ft09-0d8bbf25", "source": "ft09.py", "sha256": "aa5b54f48a29da9f276c3df0dc04de728002f523384ab868c85d56d819cd0783",
+     "metadata": {"title": "FT09", "default_fps": 8, "tags": [], "baseline_actions": [43, 12, 23, 28, 65, 37]}}
+  ]
+}

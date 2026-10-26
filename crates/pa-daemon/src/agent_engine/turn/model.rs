@@ -387,15 +387,18 @@ impl AgentSessionEngine {
                                 Ok(TurnOnce::Aborted) => return Ok(aborted_message(&model)),
                                 Err(error) => return Err(error),
                             };
-                            if !self
+                            let core = self.session.lock().await.clone();
+                            let interval_yielded = core
+                                .as_ref()
+                                .is_some_and(|core| core.session.take_auto_refine_yield());
+                            let threshold_yielded = self
                                 .threshold_yielded
-                                .swap(false, std::sync::atomic::Ordering::SeqCst)
-                            {
+                                .swap(false, std::sync::atomic::Ordering::SeqCst);
+                            if !threshold_yielded && !interval_yielded {
                                 return Ok(assistant);
                             }
                             // Requested boundaries stay owned by run_turns; consuming one here
                             // would lose its explicit stop and goal-continuation semantics.
-                            let core = self.session.lock().await.clone();
                             let pending = match core {
                                 Some(core) => {
                                     core.turn_boundary.compaction_scheduled().await
@@ -417,6 +420,21 @@ impl AgentSessionEngine {
                             }
                             if aborted() {
                                 return Ok(aborted_message(&model));
+                            }
+                            if interval_yielded {
+                                let outcome = tokio::task::block_in_place(|| {
+                                    self.consume_compact_auto_refine_round()
+                                });
+                                if !Self::emit_refinement_outcome(
+                                    outcome,
+                                    pa_core::session_engine::refine::RefinementSource::Auto,
+                                    &mut **emit,
+                                ) || aborted()
+                                {
+                                    return Ok(aborted_message(&model));
+                                }
+                                admit_prompt = false;
+                                continue;
                             }
                             // Keep the retry/failover episode alive across this artificial
                             // yield. The engine owns a multi-thread runtime; the synchronous

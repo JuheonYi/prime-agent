@@ -3,10 +3,11 @@
 /bin/
 __pycache__/
 steer-queue-runs/
+/prime-agent-runtime/runs
+/prime-agent-runtime/experiments/.venv/
 
 # local gate logs (driver downloads)
 clippy-*.log
 fmt-*.log
 tests-*.log
 test-compile-*.log
-

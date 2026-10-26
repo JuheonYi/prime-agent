@@ -38,6 +38,11 @@ Prime Agent is an open-source coding and research agent for general and long-run
 - The **[Recursive Language Model (RLM)](https://www.primeintellect.ai/blog/rlm)** treats context as variables (*prompt-as-a-variable*) and tools like recursive subagents as function calls (*programmatic tool /sub-agent calling*) inside a persistent REPL.
 - The **[Continual Harness](https://arxiv.org/abs/2605.09998)** stores supplemental prompts, memories, skill descriptions, and reusable subagent specifications as durable state that Prime Agent can refine through small, evidence-backed updates, local to the session by default.
 
+Set `PRIME_AGENT_HARNESS_SNAPSHOTS=1` to copy successful harness saves into
+full-state snapshots for inspecting changes over time (disabled by default).
+See [harness snapshots and the faux single-task check](prime-agent-runtime/experiments/harness-snapshots.md)
+for the storage format, recovery behavior, and offline ARC wiring experiment.
+
 ## Install
 
 Install the latest stable version with the one-command installer:
@@ -118,6 +123,7 @@ prime-agent shutdown [--force]       # Stop every agent, worker, and background 
 Prime Agent is built for long-running work, especially for evaluations in research. These features are available in the TUI, and when run autonomously.
 
 - **Continual Harness:** `/refine` can persist focused, reviewable lessons as supplemental prompts, memories, reusable skill descriptions, or subagent specifications, with recorded refinement history. It does not replace packaging and reviewing new executable skills.
+- **Automatic refinement review:** eligible root sessions review after 25 completed assistant turns or compaction, subject to a 20-minute review cooldown. Tool-call responses count; a review may decline to make changes. See [trigger settings](prime-agent-runtime/experiments/harness-snapshots.md#automatic-refinement-triggers).
 - **Direct agent-to-agent communication:** running agents and retained subagents can discover one another, exchange messages, and steer active work.
 - **Daemon-backed continuity:** active sessions, Python REPL state, schedules, and subagents keep running when the terminal detaches and can be reattached later.
 - **Heartbeats and schedules:** `/heartbeat`, `rlm_heartbeat`, and `prime-agent schedule` can re-enter a session periodically or at a specific time.
