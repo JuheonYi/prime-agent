@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, fields
+from dataclasses import asdict
 import importlib.metadata
 import json
 import multiprocessing
+import os
 import re
 import subprocess
 import tempfile
@@ -19,19 +20,11 @@ from envs.arc import ArcEnvironment, PROLONG_REVISION
 from model_gateway import MODEL, ModelGateway
 from sandbox import command
 
-DEFAULT_LIMITS = RunLimits(
-    seconds=600,
-    max_actions=1000,
-    max_model_requests=256,
-    max_output_tokens_per_request=8192,
-    max_model_output_tokens=131072,
-    model_concurrency=4,
-    action_cap=20,
-)
+DEFAULT_LIMITS = RunLimits(seconds=600)
 
 
 def write_json(path, value):
-    path.write_text(json.dumps(value, indent=2) + "\n")
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
 def model_usage(log: Path):
@@ -46,13 +39,13 @@ def model_usage(log: Path):
     }
 
 
-def configure_agent(directory: Path, limits: RunLimits):
+def configure_agent(directory: Path):
     write_json(directory / "models.json", {"providers": {"github-copilot": {
         "api": "openai-responses", "baseUrl": "http://127.0.0.1:9151",
         "apiKey": "local-transport-no-upstream-credential",
         "models": [{
             "id": MODEL, "name": "GPT-5.6 Sol", "reasoning": True, "input": ["text", "image"],
-            "contextWindow": 1050000, "maxTokens": limits.max_output_tokens_per_request,
+            "contextWindow": 1050000,
             "thinkingLevelMap": {"off": "none", "low": "low", "medium": "medium",
                                  "high": "high", "xhigh": "xhigh", "max": "max"},
         }],
@@ -66,11 +59,11 @@ def configure_agent(directory: Path, limits: RunLimits):
     })
 
 
-def run_game(args, limits, root, io, deadline):
+def run_game(args, root, io, deadline):
     repo = Path(__file__).resolve().parents[2]
     backend = PrimeAgentBackend(args.binary.resolve(), repo, args.kernel.resolve(),
-                                args.python_home.resolve(), root, io, limits, deadline)
-    env: Environment = ArcEnvironment(args.task, args.data.resolve(), root / "environment", limits)
+                                args.python_home.resolve(), root, io, deadline)
+    env: Environment = ArcEnvironment(args.task, args.data.resolve(), root / "environment")
     try:
         env.prepare()
         env.run(backend.analyze)
@@ -96,11 +89,18 @@ def environment_result(root):
 
 
 def execute(args, limits: RunLimits):
+    if args.data_root is not None:
+        from reproduce import MARKER, check, check_ready, environment
+
+        if (args.data_root / MARKER).is_file():
+            check_ready(args.data_root)
+            spec = json.loads((Path(__file__).parent / "repro/environment.lock.json").read_text())
+            check(args.data_root, spec, environment(args.data_root))
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
     (root / "agent").mkdir()
     (root / "workspace").mkdir()
-    configure_agent(root / "agent", limits)
+    configure_agent(root / "agent")
     write_json(root / "initial-harness-states.json", capture_states(root / "agent"))
     repo = Path(__file__).resolve().parents[2]
     distribution = importlib.metadata.distribution("prolong-agent")
@@ -116,6 +116,7 @@ def execute(args, limits: RunLimits):
         "native_autonomous_driver": False,
         "refiner_reasoning": "original minimum-supported default",
         "limits": asdict(limits),
+        "request_output_policy": "Prime Agent native default; no experiment override",
         "network": "private namespace, fixed model Unix socket only; environment via files",
         "snapshots": True, "forced_refinement": False,
         "git_revision": subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip(),
@@ -124,19 +125,19 @@ def execute(args, limits: RunLimits):
     with tempfile.TemporaryDirectory(prefix="prime-eval-io-") as temporary:
         io = Path(temporary)
         gateway = ModelGateway(io / "model.sock", args.credential_helper.resolve(), args.auth_dir.resolve(),
-                               root / "model-requests.jsonl", limits)
+                               root / "model-requests.jsonl")
         process = None
         try:
             # Resolve credentials before the timed run, never forwarding them into bwrap.
             gateway.credentials()
             probe = command(
                 args.binary.resolve(), repo, args.kernel.resolve(), args.python_home.resolve(),
-                root, io, [str(args.kernel.resolve() / "bin/python"), "-c", """
+                root, io, [str(args.kernel.resolve() / "bin/python"), "-c", f"""
 import os, socket
 import rlm, rlm.mcp, agent_message, attach_image, compact, edit, goal, refine
-assert not os.path.exists('/home/juheon/.ssh')
-assert not os.path.exists('/data/juheon/primeagent/copilot-native')
-assert not os.path.exists('/data/juheon/primeagent/benchmarks')
+assert not os.path.exists({str(Path.home() / '.ssh')!r})
+assert not os.path.exists({str(args.auth_dir.resolve())!r})
+assert not os.path.exists({str(args.data.resolve())!r})
 try:
     socket.create_connection(('1.1.1.1',443),timeout=0.2)
 except OSError:
@@ -157,13 +158,10 @@ print('SANDBOX_PREFLIGHT_PASSED')
             gateway.start(deadline)
             reason = "environment_exit"
             process = multiprocessing.get_context("spawn").Process(
-                target=run_game, args=(args, limits, root, io, deadline),
+                target=run_game, args=(args, root, io, deadline),
             )
             process.start()
             while process.is_alive():
-                if gateway.exhausted:
-                    reason = gateway.exhausted
-                    break
                 if time.monotonic() >= deadline:
                     reason = "time_limit"
                     break
@@ -178,8 +176,8 @@ print('SANDBOX_PREFLIGHT_PASSED')
             if reason == "environment_exit":
                 if final["status"] == "COMPLETED_RUN":
                     reason = "game_completed"
-                elif final["run_total_actions"] >= limits.max_actions:
-                    reason = "action_limit"
+            if reason == "environment_exit" and time.monotonic() >= deadline:
+                reason = "time_limit"
             errors = snapshot_errors(root)
             model_errors = []
             for path in (root / "agent").rglob("*.jsonl"):
@@ -187,8 +185,6 @@ print('SANDBOX_PREFLIGHT_PASSED')
                     message = json.loads(line).get("message", {})
                     if message.get("role") == "assistant" and message.get("stopReason") == "error":
                         model_errors.append(message.get("errorMessage", "model request failed"))
-            if reason == "environment_exit" and gateway.exhausted:
-                reason = gateway.exhausted
             write_json(root / "final-harness-states.json", capture_states(root / "agent"))
             report = {
                 "status": "completed" if final["status"] == "COMPLETED_RUN" else (
@@ -221,19 +217,31 @@ print('SANDBOX_PREFLIGHT_PASSED')
 def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", default="ls20")
-    for field in fields(RunLimits):
-        parser.add_argument("--" + field.name.replace("_", "-"), type=int,
-                            default=getattr(DEFAULT_LIMITS, field.name))
+    parser.add_argument("--seconds", type=int, default=DEFAULT_LIMITS.seconds)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--credential-helper", type=Path, required=True)
-    parser.add_argument("--auth-dir", type=Path, required=True)
-    parser.add_argument("--kernel", type=Path, required=True)
-    parser.add_argument("--python-home", type=Path, required=True)
-    parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, default=os.environ.get("DATA_ROOT"),
+                        help="Installation root (defaults to DATA_ROOT); explicit paths override it")
+    paths = {
+        "binary": "build/target/debug/prime-agent",
+        "credential_helper": "build/target/debug/examples/copilot_credentials",
+        "auth_dir": "copilot-native/agent",
+        "kernel": "envs/kernel",
+        "python_home": "envs/python",
+        "data": "benchmarks/arc-agi-3",
+    }
+    for name in paths:
+        parser.add_argument("--" + name.replace("_", "-"), type=Path)
     arguments = parser.parse_args(argv)
+    if arguments.data_root is not None:
+        arguments.data_root = arguments.data_root.expanduser().resolve()
+        for name, relative in paths.items():
+            if getattr(arguments, name) is None:
+                setattr(arguments, name, arguments.data_root / relative)
+    missing = ["--" + name.replace("_", "-") for name in paths if getattr(arguments, name) is None]
+    if missing:
+        parser.error("Set DATA_ROOT or supply these paths: " + ", ".join(missing))
     try:
-        limits = RunLimits(**{field.name: getattr(arguments, field.name) for field in fields(RunLimits)})
+        limits = RunLimits(seconds=arguments.seconds)
     except ValueError as error:
         parser.error(str(error))
     return arguments, limits

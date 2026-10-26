@@ -1,6 +1,6 @@
 """Small environment lifecycle contract; tools and task semantics stay environment-owned."""
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any, Protocol
@@ -9,20 +9,10 @@ from typing import Any, Protocol
 @dataclass(frozen=True)
 class RunLimits:
     seconds: int
-    max_actions: int
-    max_model_requests: int
-    max_output_tokens_per_request: int
-    max_model_output_tokens: int
-    model_concurrency: int
-    action_cap: int
 
     def __post_init__(self):
-        for field in fields(self):
-            value = getattr(self, field.name)
-            if type(value) is not int or value <= 0:
-                raise ValueError(f"{field.name} must be a positive integer")
-        if self.max_output_tokens_per_request > self.max_model_output_tokens:
-            raise ValueError("per-request output cannot exceed the aggregate output budget")
+        if type(self.seconds) is not int or self.seconds <= 0:
+            raise ValueError("seconds must be a positive integer")
 
 
 class Environment(Protocol):

@@ -1,5 +1,6 @@
 import contextlib
 import io
+import itertools
 import json
 import tempfile
 import unittest
@@ -37,16 +38,18 @@ class SnapshotLoggingTests(unittest.TestCase):
             self.assertEqual(snapshot_errors(root), [])
 
     def test_live_report_marks_snapshot_errors_incomplete_without_changing_game_outcome(self):
-        for game_status, run_status in (
-            ("COMPLETED_RUN", "completed"),
-            ("ERROR", "failed"),
-            ("NOT_FINISHED", "stopped"),
+        for game_status, run_status, stop_mode in (
+            ("COMPLETED_RUN", "completed", None),
+            ("ERROR", "failed", None),
+            ("NOT_FINISHED", "stopped", None),
+            ("ERROR", "stopped", "terminate"),
+            ("ERROR", "stopped", "kill"),
         ):
             for error_path in (None, "kernel-stderr.log", "agent/logs/worker-root.stderr.log"):
-                with self.subTest(game=game_status, error_path=error_path), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(game=game_status, error_path=error_path, stop_mode=stop_mode), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory) / "run"
                     args = SimpleNamespace(
-                        output=root, task="ls20",
+                        output=root, task="ls20", data_root=None,
                         **{name: Path("/unused") for name in (
                             "binary", "credential_helper", "auth_dir", "kernel", "python_home", "data",
                         )},
@@ -71,6 +74,9 @@ class SnapshotLoggingTests(unittest.TestCase):
                         )),
                         patch("run.subprocess.check_output", return_value="fixture-revision\n"),
                         patch("run.environment_result", side_effect=finish_environment),
+                        patch("run.time.monotonic", side_effect=itertools.chain(
+                            [0], itertools.repeat(DEFAULT_LIMITS.seconds if stop_mode else 0),
+                        )),
                         contextlib.redirect_stdout(io.StringIO()),
                     ):
                         distribution.return_value.read_text.return_value = json.dumps({
@@ -78,13 +84,20 @@ class SnapshotLoggingTests(unittest.TestCase):
                         })
                         gateway = gateway_type.return_value
                         gateway.count = 0
-                        gateway.exhausted = None
                         gateway.thread.is_alive.return_value = False
                         process = process_context.return_value.Process.return_value
-                        process.is_alive.return_value = False
+                        process.is_alive.return_value = bool(stop_mode)
                         process.exitcode = 0
+                        if stop_mode:
+                            getattr(process, stop_mode).side_effect = lambda: setattr(process.is_alive, "return_value", False)
                         execute(args, DEFAULT_LIMITS)
+                        if stop_mode:
+                            process.terminate.assert_called_once()
+                            if stop_mode == "kill":
+                                process.kill.assert_called_once()
+                            gateway.server.server_close.assert_called_once()
                     report = json.loads((root / "result.json").read_text())
+                    self.assertEqual(report["limits"], {"seconds": DEFAULT_LIMITS.seconds})
                     self.assertEqual(
                         {key: report[key] for key in (
                             "status", "logging_complete", "snapshot_errors", "environment", "stop_reason",
@@ -94,6 +107,8 @@ class SnapshotLoggingTests(unittest.TestCase):
                             "logging_complete": not errors,
                             "snapshot_errors": errors,
                             "environment": final,
-                            "stop_reason": "game_completed" if game_status == "COMPLETED_RUN" else "environment_exit",
+                            "stop_reason": "time_limit" if stop_mode else (
+                                "game_completed" if game_status == "COMPLETED_RUN" else "environment_exit"
+                            ),
                         },
                     )

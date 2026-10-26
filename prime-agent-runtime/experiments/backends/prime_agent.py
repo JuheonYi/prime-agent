@@ -12,18 +12,16 @@ from pathlib import Path
 
 from prolong_agent.agent.base import BaseAgent
 
-from contracts import RunLimits
 from model_gateway import MODEL
 from sandbox import command
 
 
 class PrimeAgentBackend(BaseAgent):
     def __init__(self, binary: Path, repo: Path, kernel: Path, python_home: Path,
-                 output: Path, io: Path, limits: RunLimits, deadline: float, *, faux: dict | None = None):
-        super().__init__(grid_mode="hex", log_window=None, action_cap=limits.action_cap,
-                         workspace="/workspace")
+                 output: Path, io: Path, deadline: float, *, faux: dict | None = None):
+        super().__init__(grid_mode="hex", log_window=None, workspace="/workspace")
         self.binary, self.repo, self.kernel, self.python_home = binary, repo, kernel, python_home
-        self.output, self.io, self.limits, self.deadline = output, io, limits, deadline
+        self.output, self.io, self.deadline = output, io, deadline
         self.faux = faux
         self.process = None
         self.events = queue.Queue()
@@ -53,13 +51,12 @@ class PrimeAgentBackend(BaseAgent):
         self.process = subprocess.Popen(launch, stdin=subprocess.DEVNULL, stdout=self.daemon_log,
                                         stderr=self.stderr)
         self.connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        startup_deadline = min(self.deadline, time.monotonic() + 20)
         while True:
             try:
                 self.connection.connect(str(self.output / "agent/eval.sock"))
                 break
             except (FileNotFoundError, ConnectionRefusedError):
-                if self.process.poll() is not None or time.monotonic() >= startup_deadline:
+                if self.process.poll() is not None or time.monotonic() >= self.deadline:
                     raise RuntimeError("Prime daemon failed to start; see stderr.log")
                 time.sleep(0.02)
         self.input = self.connection.makefile("r")

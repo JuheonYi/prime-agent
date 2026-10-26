@@ -1,4 +1,5 @@
 import hashlib
+import contextlib
 import io
 import json
 import re
@@ -12,7 +13,6 @@ from unittest.mock import patch
 
 import reproduce
 from repro import probe
-from run import DEFAULT_LIMITS, parse_arguments
 
 
 class ReproductionTests(unittest.TestCase):
@@ -86,17 +86,11 @@ class ReproductionTests(unittest.TestCase):
                 reproduce.download("https://example.invalid/archive", destination, hashlib.sha256(content).hexdigest())
             self.assertEqual(destination.read_bytes(), content)
 
-    def test_run_wrapper_keeps_original_defaults_and_forwards_only_managed_paths(self):
-        root = Path("/new machine/primeagent")
-        arguments = reproduce.experiment_arguments(root, ["--output", str(root / "runs/test")])
-        parsed, limits = parse_arguments(arguments[3:])
-        self.assertEqual(limits, DEFAULT_LIMITS)
-        self.assertEqual(parsed.binary, root / "build/target/debug/prime-agent")
-        self.assertEqual(parsed.auth_dir, root / "copilot-native/agent")
-        self.assertEqual(parsed.data, root / "benchmarks/arc-agi-3")
-        for override in ("--binary", "--data=/different"):
-            with self.assertRaisesRegex(ValueError, "managed"):
-                reproduce.experiment_arguments(root, [override])
+    def test_setup_rejects_real_experiment_execution_before_touching_files(self):
+        with contextlib.redirect_stderr(io.StringIO()), patch("reproduce.validate_root") as validate:
+            with self.assertRaises(SystemExit):
+                reproduce.main(["--root", "/unused", "run", "--seconds", "60"])
+            validate.assert_not_called()
 
     def test_package_version_drift_fails_explicitly(self):
         with patch("repro.probe.metadata.distributions", return_value=[]):

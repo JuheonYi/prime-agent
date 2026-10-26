@@ -253,29 +253,11 @@ def setup(root: Path, spec: dict, env: dict) -> None:
     print("Authenticate on this machine with the same setup.sh command followed by 'login'.")
 
 
-def experiment_arguments(root: Path, forwarded: list[str]) -> list[str]:
-    managed = {
-        "--binary": root / "build/target/debug/prime-agent",
-        "--credential-helper": root / "build/target/debug/examples/copilot_credentials",
-        "--auth-dir": root / "copilot-native/agent",
-        "--kernel": root / "envs/kernel",
-        "--python-home": root / "envs/python",
-        "--data": root / "benchmarks/arc-agi-3",
-    }
-    if any(argument.split("=", 1)[0] in managed for argument in forwarded):
-        raise ValueError("Installation paths are managed by --root; pass only existing experiment options")
-    return [str(root / "envs/arc/bin/python"), "-B", str(EXPERIMENTS / "run.py"),
-            *(str(item) for pair in managed.items() for item in pair), *forwarded]
-
-
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="Dedicated data directory outside the checkout")
-    parser.add_argument("command", choices=("setup", "check", "login", "run"), nargs="?", default="setup")
-    parser.add_argument("arguments", nargs=argparse.REMAINDER, help="Existing run.py options after 'run'")
+    parser.add_argument("command", choices=("setup", "check", "login"), nargs="?", default="setup")
     args = parser.parse_args(argv)
-    if args.command != "run" and args.arguments:
-        parser.error("Only 'run' accepts additional experiment arguments")
     root = args.root.expanduser().resolve()
     spec = json.loads(SPEC_PATH.read_text())
     env = environment(root)
@@ -303,13 +285,6 @@ def main(argv=None) -> int:
                 env["PI_PACKAGE_DIR"] = str(REPO)
                 print("Use /login, select GitHub Copilot, complete browser authorization, then exit. Do not submit a task.")
                 run([root / "build/target/debug/prime-agent", "--provider", "github-copilot"], env=env, cwd=root)
-            else:
-                check(root, spec, env)
-                if not (root / "copilot-native/agent/auth.json").is_file():
-                    raise RuntimeError("Native Copilot login required on this machine; run the 'login' command first")
-                command = experiment_arguments(root, args.arguments)
-                os.chdir(root / "runs")
-                os.execve(command[0], command, env)
         return 0
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         print(f"Experiment setup failed: {error}", file=sys.stderr)

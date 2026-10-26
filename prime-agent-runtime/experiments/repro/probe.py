@@ -147,7 +147,7 @@ def prepare_games(root: Path, download: bool) -> dict:
 
 def check_sandbox(root: Path) -> dict:
     sys.path.insert(0, str(EXPERIMENTS))
-    from run import DEFAULT_LIMITS, configure_agent
+    from run import configure_agent
     from sandbox import command
 
     with tempfile.TemporaryDirectory(prefix="isolation-check-", dir=root / "cache") as temporary:
@@ -156,7 +156,7 @@ def check_sandbox(root: Path) -> dict:
             (temporary / name).mkdir()
         private_file = temporary / "host-only"
         private_file.write_text("isolation sentinel")
-        configure_agent(temporary / "agent", DEFAULT_LIMITS)
+        configure_agent(temporary / "agent")
         code = f"""
 from pathlib import Path
 import socket

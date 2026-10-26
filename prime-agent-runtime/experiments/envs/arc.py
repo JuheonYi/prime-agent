@@ -5,20 +5,19 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 import logging
+from math import inf
 from pathlib import Path
 
 from arc_agi import Arcade, OperationMode
 from prolong_agent.environment import ArcAgi3Env
 from prolong_agent.environment.runner import GameRunner
 
-from contracts import RunLimits
-
 PROLONG_REVISION = "9d2f2d46fea8759ed494ce5b0166c7004a2e97c4"
 
 
 class ArcEnvironment:
-    def __init__(self, task: str, data: Path, output: Path, limits: RunLimits):
-        self.task, self.data, self.output, self.limits = task, data, output, limits
+    def __init__(self, task: str, data: Path, output: Path):
+        self.task, self.data, self.output = task, data, output
         self.env = None
         self.arcade = None
         self.card = None
@@ -33,7 +32,8 @@ class ArcEnvironment:
         self.card = self.arcade.open_scorecard(tags=["prime-agent", "prolong-adapter"])
         self.env = ArcAgi3Env.from_arcade(
             arcade=self.arcade, game_id=self.task, scorecard_id=self.card,
-            max_actions=self.limits.max_actions,
+            # The pinned upstream uses this only as a numeric comparison bound.
+            max_actions=inf,
         )
         (self.output / "logs.txt").write_text("")
 
@@ -42,13 +42,13 @@ class ArcEnvironment:
             raise RuntimeError("environment not prepared")
         runner = GameRunner(
             env=self.env, game_id=self.task, agent_name="prime-agent",
-            max_actions_per_game=self.limits.max_actions,
+            max_actions_per_game=inf,
             prompts_log_path=self.output / "logs.txt", agent=agent,
             log_post_board=True, agent_kwargs={"grid_mode": "hex"},
         )
         self.metrics = runner.run()
         report = self.evaluate()
-        (self.output / "metrics.json").write_text(json.dumps(report, indent=2))
+        (self.output / "metrics.json").write_text(json.dumps(report, indent=2, allow_nan=False))
         return report
 
     def evaluate(self):

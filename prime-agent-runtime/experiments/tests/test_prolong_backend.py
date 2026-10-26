@@ -2,16 +2,17 @@ import json
 import tempfile
 import time
 import unittest
-from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from prolong_agent.agent.base import BaseAgent
 from prolong_agent.agent.action_queue import ActionQueue
+from prolong_agent.environment.runner import GameRunner
 
 from backends.prime_agent import PrimeAgentBackend
 from envs.arc import ArcEnvironment
 from faux_harness_run import check_tool_errors
-from run import DEFAULT_LIMITS, configure_agent
+from run import configure_agent
 
 REPO = Path(__file__).resolve().parents[3]
 DATA = Path("/data/juheon/primeagent")
@@ -40,8 +41,7 @@ class ProlongBackendTests(unittest.TestCase):
             root = Path(temporary)
             for name in ("workspace", "agent", "io"):
                 (root / name).mkdir()
-            limits = replace(DEFAULT_LIMITS, max_actions=3, action_cap=2, seconds=60)
-            configure_agent(root / "agent", limits)
+            configure_agent(root / "agent")
             (root / "agent/models.json").write_text(json.dumps({"providers": {"faux": {
                 "api": "faux", "baseUrl": "http://localhost:0", "apiKey": "fixture",
                 "models": [{"id": "faux-1", "contextWindow": 128000, "maxTokens": 8192}],
@@ -94,17 +94,21 @@ rlm.harness.create_memory("Child", "isolated", id="child-safe")
             ]}}
             backend = PrimeAgentBackend(DATA / "build/target/debug/prime-agent", REPO,
                                         DATA / "envs/kernel", DATA / "envs/python", root, root / "io",
-                                        limits, time.monotonic() + 60, faux=faux)
+                                        time.monotonic() + 60, faux=faux)
             env = ArcEnvironment("ls20-9607627b", DATA / "benchmarks/arc-agi-3",
-                                 root / "environment", limits)
+                                 root / "environment")
             try:
                 env.prepare()
-                metrics = env.run(backend.analyze)
+                # Bound this scripted fixture, not the production experiment.
+                with patch("envs.arc.GameRunner", side_effect=lambda **kwargs: GameRunner(
+                    **(kwargs | {"max_actions_per_game": 3})
+                )):
+                    metrics = env.run(backend.analyze)
                 self.assertEqual(metrics["run_total_actions"], 3)
                 self.assertEqual(backend.calls, 2)
                 self.assertEqual(
                     (root / "task-prompt.txt").read_text(),
-                    BaseAgent(grid_mode="hex", log_window=None, action_cap=2)._build_system_prompt(
+                    BaseAgent(grid_mode="hex", log_window=None)._build_system_prompt(
                         ["ACTION1", "ACTION2", "ACTION3", "ACTION4", "RESET"]
                     ),
                 )

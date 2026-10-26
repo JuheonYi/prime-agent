@@ -1,5 +1,7 @@
 # PRO-LONG ARC environment with Prime Agent
 
+For copy/paste commands only, see [HOW_TO_RUN.md](HOW_TO_RUN.md).
+
 ## Reproduce this installation
 
 Clone the fork at the commit/tag containing these experiment changes, then run
@@ -78,18 +80,41 @@ or model is not substituted if your account lacks access.
 ### Run an experiment
 
 ```bash
-bash prime-agent-runtime/experiments/setup.sh --root "$DATA_ROOT" run \
-  --task ft09-0d8bbf25 --seconds 60 --max-actions 1000 \
-  --max-model-requests 32 --max-model-output-tokens 32768 \
+"$DATA_ROOT/envs/arc/bin/python" prime-agent-runtime/experiments/run.py \
+  --task ft09-0d8bbf25 --seconds 60 \
   --output "$DATA_ROOT/runs/ft09-smoke-001"
 ```
 
-Use `--task ls20-9607627b` for LS20. `run` supplies installation paths to
-the existing [run.py](run.py) and forwards the other options unchanged.
-Output directories must be new. This command uses real model quota;
-installation does not launch it automatically. Defaults, prompts, main/refiner
-reasoning, 25-turn review, cooldown, action cap, snapshots, and isolation
-remain those of the existing runner/runtime.
+Use `--task ls20-9607627b` for LS20. [run.py](run.py) reads installation paths
+from `DATA_ROOT` (or `--data-root`); explicit path options still override them.
+Managed installations are checked before execution. The earlier manually
+prepared data root also works, without being adopted or modified by setup.
+
+**`setup.sh` does not run experiments.** It handles installation, offline smoke
+checks, and login only. `run.py` handles both real 60-second smoke runs and long
+experiments. Output directories must be new. This command consumes real model
+quota; installation never starts it automatically.
+
+### Time-only experiment budget
+
+`--seconds` is the only experiment budget (default: 600). There is no total
+action, request, or output-token budget, and no wrapper-imposed model concurrency
+limit. Counts and usage are still logged. The wrapper's 8,192-token output
+override, 4-MiB request-body ceiling, and 90-second streaming read ceiling are
+removed; provider streaming reads use the remaining experiment time.
+
+The pinned PRO-LONG API takes numeric action bounds. The adapter passes actual
+positive infinity to its two comparison-only bounds, not a large finite count.
+Upstream source is unchanged; infinity is not serialized into manifests or
+metrics. The original 20-action **plan length**, prompts, reset/queue policy,
+game rules, main/refiner reasoning, and Prime Agent's native per-request output
+policy remain unchanged. The model configuration no longer overrides `maxTokens`.
+
+The parent process enforces the deadline even during tool execution or retries.
+Game completion, an actual error, or user interruption can end a run earlier;
+usage counters cannot. Setup's offline checks have their own bounded diagnostic
+timeouts and do not spend model quota. No monetary/token spending cap is implied
+by a wall-clock limit.
 
 ### Verify without inference
 
@@ -145,7 +170,8 @@ The old `arc_bridge.py` is used only by the separate faux logging fixture.
 
 ## Local components
 
-- `run.py`: common limits, setup, bounded worker lifecycle, and final reporting.
+- `setup.sh` / `reproduce.py`: installation, offline smoke checks, and native login.
+- `run.py`: installation path resolution, time-limited experiment lifecycle, and reporting.
 - `envs/arc.py`: small lifecycle wrapper around the upstream environment/runner.
 - `backends/prime_agent.py`: implements `BaseAgent.analyze` through the existing
   Prime Agent daemon API. One root session and Python kernel persist across
@@ -181,11 +207,10 @@ through the repository's `copilot_credentials` helper over a private pipe.
 The gateway rejects other models/routes, redirects, remote image/file URLs,
 and server-side tools such as web search. No coproxy or Copilot SDK is used.
 
-All defaults live in `run.py`'s `DEFAULT_LIMITS`: time, environment actions, model
-requests, output per request, aggregate output, concurrency, and action-plan
-length. The adapters receive a `RunLimits` object rather than private defaults.
-The manifest records effective limits. PRO-LONG's own retry/reset/queue policy
-is preserved; a parent process enforces wall time even during upstream retries.
+The manifest and result record `limits: {"seconds": ...}`. PRO-LONG's own
+retry/reset/queue policy is preserved; only the experiment's accumulated action
+bound is disabled. The gateway continues validating model, route, credentials,
+and request shape without applying experiment usage budgets.
 
 This is not a separate VM or protection against kernel vulnerabilities. Hard
 cgroup CPU/memory/disk quotas are not provided. Timing/transport/model choices
@@ -198,7 +223,7 @@ runner remains directly callable with explicit paths:
 
 ```bash
 "$DATA_ROOT/envs/arc/bin/python" prime-agent-runtime/experiments/run.py \
-  --task ls20-9607627b --seconds 1800 --max-actions 10000 \
+  --task ls20-9607627b --seconds 1800 \
   --output "$DATA_ROOT/runs/ls20-30min-001" \
   --binary "$DATA_ROOT/build/target/debug/prime-agent" \
   --credential-helper "$DATA_ROOT/build/target/debug/examples/copilot_credentials" \

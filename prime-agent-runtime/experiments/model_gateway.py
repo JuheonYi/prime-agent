@@ -13,10 +13,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from contracts import RunLimits
-
 MODEL = "gpt-5.6-sol"
-MAX_REQUEST_BYTES = 4 * 1024 * 1024
 ALLOWED_KEYS = {
     "model", "input", "instructions", "stream", "store", "max_output_tokens",
     "temperature", "top_p", "reasoning", "include", "tools", "tool_choice",
@@ -30,7 +27,7 @@ HEADERS = {
 }
 
 
-def validate_payload(payload, limits: RunLimits):
+def validate_payload(payload):
     if not isinstance(payload, dict) or set(payload) - ALLOWED_KEYS:
         raise ValueError("unsupported request fields")
     if payload.get("model") != MODEL:
@@ -44,8 +41,8 @@ def validate_payload(payload, limits: RunLimits):
     if isinstance(choice, dict) and choice.get("type") != "function":
         raise ValueError("server-side tool selection is forbidden")
     tokens = payload.get("max_output_tokens")
-    if isinstance(tokens, bool) or not isinstance(tokens, int) or not 1 <= tokens <= limits.max_output_tokens_per_request:
-        raise ValueError("output token cap exceeded")
+    if tokens is not None and (type(tokens) is not int or tokens <= 0):
+        raise ValueError("max_output_tokens must be a positive integer when supplied")
     items = payload.get("input", [])
     if isinstance(items, list):
         for item in items:
@@ -68,15 +65,11 @@ class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
 
 class ModelGateway:
-    def __init__(self, socket: Path, helper: Path, agent_dir: Path, log: Path, limits: RunLimits):
+    def __init__(self, socket: Path, helper: Path, agent_dir: Path, log: Path):
         self.socket, self.helper, self.agent_dir, self.log = socket, helper, agent_dir, log
-        self.limits = limits
         self.deadline = 0.0
         self.count = 0
-        self.reserved = 0
-        self.exhausted = None
         self.lock = threading.Lock()
-        self.active = threading.BoundedSemaphore(limits.model_concurrency)
         gateway = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -99,26 +92,19 @@ class ModelGateway:
                     return
                 try:
                     length = int(lengths[0])
-                    if not 0 < length <= MAX_REQUEST_BYTES:
+                    if length <= 0:
                         raise ValueError("request size")
                     payload = json.loads(self.rfile.read(length))
-                    tokens = validate_payload(payload, gateway.limits)
+                    tokens = validate_payload(payload)
                 except (ValueError, TypeError):
                     self.send_error(400, "invalid or forbidden model request")
                     return
                 with gateway.lock:
-                    if time.monotonic() >= gateway.deadline or gateway.count >= gateway.limits.max_model_requests or gateway.reserved + tokens > gateway.limits.max_model_output_tokens:
-                        gateway.exhausted = "time_limit" if time.monotonic() >= gateway.deadline else (
-                            "model_request_limit" if gateway.count >= gateway.limits.max_model_requests else "model_output_budget"
-                        )
-                        self.send_error(429, "experiment budget exhausted")
-                        return
-                    if not gateway.active.acquire(blocking=False):
-                        self.send_error(429, "concurrency limit")
+                    if time.monotonic() >= gateway.deadline:
+                        self.send_error(429, "experiment time limit")
                         return
                     gateway.count += 1
                     number = gateway.count
-                    gateway.reserved += tokens
                     with gateway.log.open("a") as stream:
                         stream.write(json.dumps({"event": "started", "request": number,
                                                  "model": MODEL, "output_cap": tokens}) + "\n")
@@ -133,12 +119,14 @@ class ModelGateway:
                     for name in ("X-ACP-Model-Request-ID", "Idempotency-Key", "session_id", "x-client-request-id"):
                         if name in self.headers:
                             headers[name] = self.headers[name]
-                    remaining = max(1, min(90, gateway.deadline - time.monotonic()))
+                    remaining = gateway.deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("experiment deadline")
                     with requests.Session() as session:
                         session.trust_env = False
                         with session.post(credential["endpoint"] + "/responses", json=payload,
                                           headers=headers, stream=True, allow_redirects=False,
-                                          timeout=(10, remaining)) as response:
+                                          timeout=(min(10, remaining), remaining)) as response:
                             record["status"] = response.status_code
                             self.send_response(response.status_code)
                             self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
@@ -167,11 +155,8 @@ class ModelGateway:
                     record["seconds"] = time.monotonic() - started
                     with gateway.lock, gateway.log.open("a") as stream:
                         if isinstance(usage, dict) and isinstance(usage.get("output_tokens"), int):
-                            actual = usage["output_tokens"]
-                            gateway.reserved -= tokens - min(tokens, max(0, actual))
                             record["usage"] = usage
                         stream.write(json.dumps(record) + "\n")
-                    gateway.active.release()
 
         self.server = UnixServer(str(socket), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

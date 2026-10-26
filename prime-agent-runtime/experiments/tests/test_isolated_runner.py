@@ -3,12 +3,11 @@ import subprocess
 import tempfile
 import time
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from model_gateway import ModelGateway, validate_payload
-from run import DEFAULT_LIMITS, configure_agent
+from run import configure_agent
 from sandbox import command
 
 REPO = Path(__file__).resolve().parents[3]
@@ -24,12 +23,12 @@ class ModelPolicyTests(unittest.TestCase):
         payload = self.payload()
         payload["tools"] = [{"type": "function", "name": "python_repl", "parameters": {}}]
         before = json.dumps(payload)
-        self.assertEqual(validate_payload(payload, DEFAULT_LIMITS), 1024)
+        self.assertEqual(validate_payload(payload), 1024)
         self.assertEqual(json.dumps(payload), before)
 
-    def test_model_search_remote_inputs_routes_and_budgets_are_rejected(self):
+    def test_model_search_remote_inputs_routes_and_invalid_shapes_are_rejected(self):
         cases = [
-            {"model": "another-model"}, {"max_output_tokens": 128000},
+            {"model": "another-model"}, {"max_output_tokens": -1}, {"max_output_tokens": True},
             {"tools": [{"type": "web_search"}]}, {"tools": [{"type": "mcp", "server_url": "https://example.org"}]},
             {"tool_choice": {"type": "web_search"}}, {"base_url": "https://example.org"},
             {"input": [{"role": "user", "content": [{"type": "input_image", "image_url": "https://example.org/image"}]}]},
@@ -37,7 +36,7 @@ class ModelPolicyTests(unittest.TestCase):
         ]
         for change in cases:
             with self.subTest(change=change), self.assertRaises(ValueError):
-                validate_payload(self.payload() | change, DEFAULT_LIMITS)
+                validate_payload(self.payload() | change)
 
 
 class FakeResponse:
@@ -61,10 +60,9 @@ class IsolationIntegrationTests(unittest.TestCase):
             root = Path(temporary)
             for name in ("agent", "workspace", "io"):
                 (root / name).mkdir()
-            limits = replace(DEFAULT_LIMITS, max_model_requests=1)
-            configure_agent(root / "agent", limits)
+            configure_agent(root / "agent")
             gateway = ModelGateway(root / "io/model.sock", Path("/unused"), Path("/unused"),
-                                   root / "requests.jsonl", limits)
+                                   root / "requests.jsonl")
             calls = []
 
             class Session:
@@ -98,7 +96,7 @@ for address in (("1.1.1.1",443),("127.0.0.1",9152)):
 payload={"model":"gpt-5.6-sol","input":[],"stream":True,"store":False,"max_output_tokens":1024}
 r=requests.post("http://127.0.0.1:9151/responses",json=payload,timeout=5)
 assert r.status_code==200 and '"fixture":true' in r.text
-assert requests.post("http://127.0.0.1:9151/responses",json=payload,timeout=5).status_code==429
+assert requests.post("http://127.0.0.1:9151/responses",json=payload,timeout=5).status_code==200
 assert requests.post("http://127.0.0.1:9151/models",json=payload,timeout=5).status_code==403
 payload["tools"]=[{"type":"web_search"}]
 assert requests.post("http://127.0.0.1:9151/responses",json=payload,timeout=5).status_code==400
@@ -115,10 +113,9 @@ print("ISOLATION_PASSED")
                     result = subprocess.run(launch, capture_output=True, text=True, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 self.assertIn("ISOLATION_PASSED", result.stdout)
-                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(calls), 2)
                 self.assertEqual(calls[0][0], "https://api.enterprise.githubcopilot.com/responses")
                 self.assertEqual(calls[0][1]["headers"]["Authorization"], "Bearer fixture-token")
-                self.assertEqual(gateway.reserved, 2)
-                self.assertEqual(gateway.exhausted, "model_request_limit")
+                self.assertEqual(gateway.count, 2)
             finally:
                 gateway.close()
